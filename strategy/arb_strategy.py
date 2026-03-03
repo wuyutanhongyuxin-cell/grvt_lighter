@@ -65,7 +65,9 @@ class ArbStrategy:
 
         # Strategy components
         self.ob_manager = OrderBookManager(self.grvt_client, self.lighter_client)
-        self.spread_analyzer = SpreadAnalyzer(config.long_threshold, config.short_threshold)
+        self.spread_analyzer = SpreadAnalyzer(
+            config.long_threshold, config.short_threshold, config.min_spread
+        )
         self.positions = PositionTracker(config.order_quantity, config.max_position)
         self.data_logger = DataLogger(config.ticker)
         self.telegram = TelegramNotifier(config.tg_bot_token, config.tg_chat_id)
@@ -84,12 +86,14 @@ class ArbStrategy:
         self._last_balance_check: float = 0
         self._last_heartbeat: float = 0
         self._low_balance_first_check: Optional[float] = None
+        self._last_signal_time: float = 0
 
     async def initialize(self) -> None:
         logger.info("Initializing strategy...")
         logger.info(f"Config: ticker={self.config.ticker} size={self.config.order_quantity} "
                      f"max_pos={self.config.max_position} "
-                     f"long_thresh={self.config.long_threshold} short_thresh={self.config.short_threshold}")
+                     f"long_thresh={self.config.long_threshold} short_thresh={self.config.short_threshold} "
+                     f"min_spread={self.config.min_spread} cooldown={self.config.signal_cooldown}s")
 
         await self.grvt_client.connect()
         await self.lighter_client.connect()
@@ -189,8 +193,8 @@ class ArbStrategy:
                 total_trades=self.order_manager.total_trades,
                 diff_long=float(stats["diff_long"]),
                 diff_short=float(stats["diff_short"]),
-                long_trigger=float(stats["long_threshold"]),
-                short_trigger=float(stats["short_threshold"]),
+                long_trigger=float(stats["effective_long_trigger"]),
+                short_trigger=float(stats["effective_short_trigger"]),
                 grvt_position=self.positions.grvt_position,
                 lighter_position=self.positions.lighter_position,
                 net_position=self.positions.get_net_position(),
@@ -216,9 +220,35 @@ class ArbStrategy:
         await self.positions.reconcile_with_api(self.grvt_client, self.lighter_client)
 
         # 9. Signal detection
+        if self.order_manager.is_trading_halted:
+            if loop_count % 200 == 0:
+                logger.warning(f"Trading halted by order manager: {self.order_manager.halt_reason}")
+            return
+
         direction, spread_value = self.spread_analyzer.check_signal()
         if direction:
-            logger.info(f"SIGNAL: {direction} spread=${spread_value:.4f}")
+            elapsed = Decimal(str(now - self._last_signal_time)) if self._last_signal_time else Decimal("999999")
+            if elapsed < self.config.signal_cooldown:
+                if loop_count % 20 == 0:
+                    logger.info(
+                        f"SIGNAL SKIPPED (cooldown): direction={direction} "
+                        f"elapsed={elapsed:.3f}s cooldown={self.config.signal_cooldown}s"
+                    )
+                return
+
+            stats = self.spread_analyzer.get_stats()
+            if direction == "long_grvt":
+                diff = stats["diff_long"]
+                trigger = stats["effective_long_trigger"]
+            else:
+                diff = stats["diff_short"]
+                trigger = stats["effective_short_trigger"]
+
+            logger.info(
+                f"SIGNAL: direction={direction} diff=${diff:.4f} "
+                f"trigger=${trigger:.4f} min_spread=${stats['min_spread']:.4f}"
+            )
+            self._last_signal_time = now
             await self.order_manager.execute_arb(direction)
 
     async def _check_balance(self):

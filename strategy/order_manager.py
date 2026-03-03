@@ -31,6 +31,7 @@ logger = logging.getLogger("arbitrage.orders")
 # Constants
 POST_ONLY_MAX_RETRIES = 15
 LIGHTER_FILL_TIMEOUT = 30  # seconds
+CANCEL_CHECK_GRACE_TIMEOUT = 1.0  # seconds
 VALID_DIRECTIONS = {"long_grvt", "short_grvt"}
 
 
@@ -54,6 +55,8 @@ class OrderManager:
         self.fill_timeout = fill_timeout
 
         self._executing = False
+        self._trading_halted = False
+        self._halt_reason = ""
         self.total_trades = 0
 
     async def execute_arb(self, direction: str) -> Optional[dict]:
@@ -63,6 +66,10 @@ class OrderManager:
 
         Returns trade result dict on success, None on failure/skip.
         """
+        if self._trading_halted:
+            logger.warning(f"Trading halted, skipping signal (reason={self._halt_reason})")
+            return None
+
         if self._executing:
             logger.warning("Already executing, skipping")
             return None
@@ -126,17 +133,26 @@ class OrderManager:
                 # ============ Phase 2: Wait for GRVT fill via WS ============
                 logger.info(f"=== PHASE 2: Waiting for GRVT fill (timeout={self.fill_timeout}s) ===")
                 grvt_fill_data = await self.grvt_client.wait_for_fill(
-                    client_order_id, timeout=self.fill_timeout,
+                    client_order_id, timeout=self.fill_timeout, keep_pending_on_timeout=True,
                 )
 
                 if grvt_fill_data is None:
-                    # Timeout — cancel order and check for partial fill
-                    logger.info(f"GRVT fill timeout, canceling order cid={client_order_id}")
-                    await self.grvt_client.cancel_order(client_order_id)
+                    # Timeout => uncertain state. Run cancel-check + short reconcile window.
+                    logger.info(f"GRVT fill timeout, entering cancel-check cid={client_order_id}")
+                    cancel_ok = await self.grvt_client.cancel_order(client_order_id)
+                    if not cancel_ok:
+                        logger.warning(f"GRVT cancel failed/uncertain: cid={client_order_id}")
                     await asyncio.sleep(0.5)  # Let cancel process
 
                     # Check if partial fill came through before/during cancel
                     grvt_fill_data = self.grvt_client.get_last_fill(client_order_id)
+                    if grvt_fill_data is None:
+                        # One extra grace window for late WS fill after cancel.
+                        grvt_fill_data = await self.grvt_client.wait_for_fill(
+                            client_order_id, timeout=CANCEL_CHECK_GRACE_TIMEOUT,
+                        )
+                    else:
+                        self.grvt_client.clear_pending_fill(client_order_id)
                     if grvt_fill_data and grvt_fill_data["filled_size"] > 0:
                         logger.info(f"Partial fill detected after cancel: {grvt_fill_data['filled_size']}")
                         break
@@ -180,6 +196,8 @@ class OrderManager:
                 )
                 # Update only GRVT position — creates known imbalance
                 self.positions.update_grvt(grvt_side, confirmed_fill_size)
+                self._trading_halted = True
+                self._halt_reason = "HEDGE_SUBMIT_FAILED"
                 await self.telegram.notify_emergency(
                     f"HEDGE FAILURE: GRVT {grvt_side} {confirmed_fill_size} filled, "
                     f"Lighter {lighter_side} failed: {e}"
@@ -200,6 +218,8 @@ class OrderManager:
                 )
                 self.positions.update_grvt(grvt_side, confirmed_fill_size)
                 # Don't update lighter position (we don't know if it filled)
+                self._trading_halted = True
+                self._halt_reason = "HEDGE_FILL_UNKNOWN"
                 await self.telegram.notify_emergency(
                     f"LIGHTER FILL TIMEOUT: GRVT {grvt_side} {confirmed_fill_size} confirmed, "
                     f"Lighter {lighter_side} fill unknown after {LIGHTER_FILL_TIMEOUT}s"
@@ -288,3 +308,11 @@ class OrderManager:
             f"Lighter={self.positions.lighter_position} "
             f"net={self.positions.get_net_position()}"
         )
+
+    @property
+    def is_trading_halted(self) -> bool:
+        return self._trading_halted
+
+    @property
+    def halt_reason(self) -> str:
+        return self._halt_reason

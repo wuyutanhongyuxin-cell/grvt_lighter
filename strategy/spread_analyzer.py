@@ -11,9 +11,10 @@ logger = logging.getLogger("arbitrage.spread")
 
 
 class SpreadAnalyzer:
-    def __init__(self, long_threshold: Decimal, short_threshold: Decimal):
+    def __init__(self, long_threshold: Decimal, short_threshold: Decimal, min_spread: Decimal):
         self.long_threshold = long_threshold
         self.short_threshold = short_threshold
+        self.min_spread = min_spread
 
         self.diff_long: Decimal = Decimal("0")
         self.diff_short: Decimal = Decimal("0")
@@ -46,10 +47,13 @@ class SpreadAnalyzer:
           "long_grvt" → buy on GRVT, sell on Lighter
           "short_grvt" → sell on GRVT, buy on Lighter
         """
-        if self.diff_long > self.long_threshold:
+        long_trigger = max(self.long_threshold, self.min_spread)
+        short_trigger = max(self.short_threshold, self.min_spread)
+
+        if self.diff_long > long_trigger:
             return "long_grvt", self.diff_long
 
-        if self.diff_short > self.short_threshold:
+        if self.diff_short > short_trigger:
             return "short_grvt", self.diff_short
 
         return None, Decimal("0")
@@ -60,6 +64,9 @@ class SpreadAnalyzer:
             "diff_short": self.diff_short,
             "long_threshold": self.long_threshold,
             "short_threshold": self.short_threshold,
-            "long_gap": self.long_threshold - self.diff_long,
-            "short_gap": self.short_threshold - self.diff_short,
+            "min_spread": self.min_spread,
+            "effective_long_trigger": max(self.long_threshold, self.min_spread),
+            "effective_short_trigger": max(self.short_threshold, self.min_spread),
+            "long_gap": max(self.long_threshold, self.min_spread) - self.diff_long,
+            "short_gap": max(self.short_threshold, self.min_spread) - self.diff_short,
         }

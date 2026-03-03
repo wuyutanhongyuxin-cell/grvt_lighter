@@ -340,23 +340,35 @@ class GrvtClient(BaseExchangeClient):
         self._fill_results.pop(client_order_id, None)
         return False
 
-    async def wait_for_fill(self, client_order_id: str, timeout: float) -> Optional[dict]:
+    async def wait_for_fill(
+        self,
+        client_order_id: str,
+        timeout: float,
+        keep_pending_on_timeout: bool = False,
+    ) -> Optional[dict]:
         """Wait for fill event from WS. Returns fill data or None on timeout."""
         event = self._pending_fills.get(client_order_id)
         if not event:
-            return None
+            # Late fill may already be cached.
+            return self._fill_results.pop(client_order_id, None)
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
+            self._pending_fills.pop(client_order_id, None)
             return self._fill_results.pop(client_order_id, None)
         except asyncio.TimeoutError:
             logger.warning(f"GRVT fill timeout: cid={client_order_id} after {timeout}s")
-            return None
-        finally:
+            if keep_pending_on_timeout:
+                return None
             self._pending_fills.pop(client_order_id, None)
+            return None
+
+    def clear_pending_fill(self, client_order_id: str) -> None:
+        """Clear pending fill event while keeping cached fill result if present."""
+        self._pending_fills.pop(client_order_id, None)
 
     def get_last_fill(self, client_order_id: str) -> Optional[dict]:
         """Get fill result if already available (for checking after cancel)."""
-        return self._fill_results.get(client_order_id)
+        return self._fill_results.pop(client_order_id, None)
 
     async def cancel_order(self, client_order_id: str) -> bool:
         """Cancel order by client_order_id."""

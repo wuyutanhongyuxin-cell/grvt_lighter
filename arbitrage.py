@@ -27,7 +27,10 @@ async def main() -> int:
     logger.info("=" * 60)
     logger.info("Lighter + GRVT Cross-Exchange Arbitrage")
     logger.info(f"Ticker: {config.ticker} | Size: {config.order_quantity} | Max Pos: {config.max_position}")
-    logger.info(f"Thresholds: long={config.long_threshold} short={config.short_threshold}")
+    logger.info(
+        f"Thresholds: long={config.long_threshold} short={config.short_threshold} "
+        f"min_spread={config.min_spread} cooldown={config.signal_cooldown}s"
+    )
     logger.info(f"Fill timeout: {config.fill_timeout}s")
     logger.info("=" * 60)
 

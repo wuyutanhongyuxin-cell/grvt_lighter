@@ -7,6 +7,7 @@ from unittest.mock import patch
 from config import Config
 from exchanges.grvt_client import GrvtClient
 from strategy.order_manager import OrderManager
+from strategy.spread_analyzer import SpreadAnalyzer
 
 try:
     from exchanges.lighter_client import LighterClient
@@ -17,15 +18,89 @@ except Exception as exc:  # pragma: no cover
 
 
 class DummyPositionTracker:
-    pass
+    grvt_position = Decimal("0")
+    lighter_position = Decimal("0")
+
+    def check_pre_trade(self):
+        return True
+
+    def can_long_grvt(self):
+        return True
+
+    def can_short_grvt(self):
+        return True
+
+    def update_grvt(self, side, qty):
+        if side == "buy":
+            self.grvt_position += qty
+        else:
+            self.grvt_position -= qty
+
+    def update_lighter(self, side, qty):
+        if side == "buy":
+            self.lighter_position += qty
+        else:
+            self.lighter_position -= qty
+
+    def get_net_position(self):
+        return abs(self.grvt_position + self.lighter_position)
 
 
 class DummyDataLogger:
-    pass
+    def log_trade(self, **kwargs):
+        return None
 
 
 class DummyTelegram:
-    pass
+    async def notify_emergency(self, text):
+        return None
+
+    async def notify_trade(self, **kwargs):
+        return None
+
+
+class FakeGrvtClientForOrderManager:
+    tick_size = Decimal("0.1")
+
+    def __init__(self):
+        self.place_calls = 0
+
+    async def get_position(self, market_id: str = ""):
+        return Decimal("0")
+
+    def get_bbo(self):
+        return Decimal("100"), Decimal("101")
+
+    async def place_post_only_order(self, side: str, price: Decimal, size: Decimal):
+        self.place_calls += 1
+        return f"cid-{self.place_calls}"
+
+    async def wait_for_fill(self, client_order_id: str, timeout: float, keep_pending_on_timeout: bool = False):
+        return {
+            "filled_size": Decimal("0.1"),
+            "price": Decimal("100"),
+            "status": "FILLED",
+        }
+
+    async def cancel_order(self, client_order_id: str):
+        return True
+
+    def get_last_fill(self, client_order_id: str):
+        return None
+
+    def clear_pending_fill(self, client_order_id: str):
+        return None
+
+
+class FakeLighterClientSubmitFail:
+    async def get_position(self, market_id: str = ""):
+        return Decimal("0")
+
+    async def place_ioc_order(self, side: str, size: Decimal):
+        raise RuntimeError("submit failed")
+
+    async def wait_for_fill(self, client_order_index: int, timeout: float):
+        return None
 
 
 class FakeWs:
@@ -82,6 +157,50 @@ class SafetyFixesTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(SystemExit):
             cfg.validate()
 
+    def test_config_rejects_negative_min_spread_and_cooldown(self):
+        cfg = Config(
+            grvt_private_key="k",
+            grvt_api_key="k",
+            grvt_trading_account_id="k",
+            lighter_private_key="k",
+            order_quantity=Decimal("1"),
+            max_position=Decimal("1"),
+            long_threshold=Decimal("1"),
+            short_threshold=Decimal("1"),
+            min_spread=Decimal("-0.1"),
+            signal_cooldown=Decimal("-1"),
+            fill_timeout=1,
+        )
+        with self.assertRaises(SystemExit):
+            cfg.validate()
+
+    def test_spread_analyzer_respects_min_spread_gate(self):
+        analyzer = SpreadAnalyzer(
+            long_threshold=Decimal("3"),
+            short_threshold=Decimal("3"),
+            min_spread=Decimal("5"),
+        )
+        analyzer.update(
+            lighter_bid=Decimal("104"),
+            lighter_ask=Decimal("105"),
+            grvt_bid=Decimal("100"),
+            grvt_ask=Decimal("101"),
+        )
+
+        direction, spread = analyzer.check_signal()
+        self.assertIsNone(direction)
+        self.assertEqual(spread, Decimal("0"))
+
+        analyzer.update(
+            lighter_bid=Decimal("106"),
+            lighter_ask=Decimal("107"),
+            grvt_bid=Decimal("100"),
+            grvt_ask=Decimal("101"),
+        )
+        direction, spread = analyzer.check_signal()
+        self.assertEqual(direction, "long_grvt")
+        self.assertEqual(spread, Decimal("6"))
+
     def test_grvt_tick_size_parsing(self):
         self.assertEqual(
             GrvtClient._parse_tick_size_from_market({"tick_size": "0.5"}),
@@ -124,6 +243,49 @@ class SafetyFixesTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(recovered)
         self.assertNotIn(cid, client._pending_fills)
         self.assertNotIn(cid, client._fill_results)
+
+    async def test_grvt_wait_timeout_can_keep_pending_for_cancel_check(self):
+        client = GrvtClient("k", "k", "k", "prod", "BTC")
+        cid = "late-1"
+        client._pending_fills[cid] = asyncio.Event()
+
+        result = await client.wait_for_fill(cid, timeout=0.01, keep_pending_on_timeout=True)
+        self.assertIsNone(result)
+        self.assertIn(cid, client._pending_fills)
+
+        client._on_order_update(
+            {
+                "client_order_id": cid,
+                "status": "FILLED",
+                "filled_size": "0.1",
+                "price": "100",
+            }
+        )
+        late_fill = await client.wait_for_fill(cid, timeout=0.1)
+        self.assertIsNotNone(late_fill)
+        self.assertEqual(late_fill["filled_size"], Decimal("0.1"))
+        self.assertNotIn(cid, client._pending_fills)
+
+    async def test_order_manager_halts_trading_after_hedge_submit_failure(self):
+        manager = OrderManager(
+            grvt_client=FakeGrvtClientForOrderManager(),
+            lighter_client=FakeLighterClientSubmitFail(),
+            positions=DummyPositionTracker(),
+            data_logger=DummyDataLogger(),
+            telegram=DummyTelegram(),
+            order_quantity=Decimal("0.1"),
+            fill_timeout=5,
+        )
+
+        first = await manager.execute_arb("long_grvt")
+        self.assertIsNone(first)
+        self.assertTrue(manager.is_trading_halted)
+        self.assertEqual(manager.halt_reason, "HEDGE_SUBMIT_FAILED")
+
+        grvt = manager.grvt_client
+        second = await manager.execute_arb("long_grvt")
+        self.assertIsNone(second)
+        self.assertEqual(grvt.place_calls, 1)
 
     def test_lighter_filled_base_amount_normalization(self):
         if LighterClient is None:

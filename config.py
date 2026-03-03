@@ -31,6 +31,8 @@ class Config:
     max_position: Decimal = Decimal("0")
     long_threshold: Decimal = Decimal("10")
     short_threshold: Decimal = Decimal("10")
+    min_spread: Decimal = Decimal("0")
+    signal_cooldown: Decimal = Decimal("0")
     fill_timeout: int = 5  # GRVT maker fill timeout (seconds)
     log_level: str = "INFO"
 
@@ -58,6 +60,8 @@ class Config:
             max_position=Decimal(args.max_position),
             long_threshold=Decimal(args.long_threshold),
             short_threshold=Decimal(args.short_threshold),
+            min_spread=Decimal(args.min_spread),
+            signal_cooldown=Decimal(args.signal_cooldown),
             fill_timeout=args.fill_timeout,
             log_level=args.log_level,
         )
@@ -83,6 +87,10 @@ class Config:
             errors.append("--long-threshold must be positive")
         if self.short_threshold <= 0:
             errors.append("--short-threshold must be positive")
+        if self.min_spread < 0:
+            errors.append("--min-spread must be non-negative")
+        if self.signal_cooldown < 0:
+            errors.append("--signal-cooldown must be non-negative")
         if self.fill_timeout <= 0:
             errors.append("--fill-timeout must be positive")
         if errors:
@@ -102,6 +110,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-position", required=True, help="Max single-side position")
     parser.add_argument("--long-threshold", default="10", help="Long signal threshold in USD (default: 10)")
     parser.add_argument("--short-threshold", default="10", help="Short signal threshold in USD (default: 10)")
+    parser.add_argument("--min-spread", default="0", help="Global minimum spread gate in USD (default: 0)")
+    parser.add_argument("--signal-cooldown", default="0", help="Signal cooldown in seconds (default: 0)")
     parser.add_argument("--fill-timeout", type=int, default=5, help="GRVT maker fill timeout in seconds (default: 5)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
     return parser.parse_args()
