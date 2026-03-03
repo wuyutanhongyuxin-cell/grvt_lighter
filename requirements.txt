@@ -1,0 +1,5 @@
+grvt-pysdk>=0.1.0
+lighter-sdk
+websockets>=12.0
+python-dotenv
+aiohttp>=3.9

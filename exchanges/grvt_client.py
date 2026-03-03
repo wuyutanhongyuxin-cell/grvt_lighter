@@ -1,0 +1,410 @@
+"""
+GRVT exchange client — Maker side (post-only orders).
+
+Uses grvt-pysdk GrvtCcxtWS for WebSocket streaming + order placement.
+Fill detection via WS 'order' feed with asyncio.Event confirmation.
+"""
+
+import asyncio
+import logging
+import os
+import time
+from decimal import Decimal
+from typing import Optional, Tuple
+
+from .base import BaseExchangeClient
+
+logger = logging.getLogger("arbitrage.grvt")
+
+# Constants
+MINI_TICKER_RATE = 100  # ms
+ORDER_DURATION = 300  # seconds — post-only order TTL
+WS_STALE_THRESHOLD = 30  # seconds
+
+# Ticker mapping: our short names → GRVT symbol format
+TICKER_MAP = {
+    "BTC": "BTC_USDT_Perp",
+    "ETH": "ETH_USDT_Perp",
+}
+
+
+class GrvtClient(BaseExchangeClient):
+    def __init__(
+        self,
+        private_key: str,
+        api_key: str,
+        trading_account_id: str,
+        env: str,
+        ticker: str,
+    ):
+        self._private_key = private_key
+        self._api_key = api_key
+        self._trading_account_id = trading_account_id
+        self._env = env
+        self._ticker = ticker
+        self._symbol = TICKER_MAP.get(ticker, f"{ticker}_USDT_Perp")
+
+        # SDK client
+        self._ws = None  # GrvtCcxtWS instance
+
+        # BBO state (from mini ticker)
+        self._best_bid: Optional[Decimal] = None
+        self._best_ask: Optional[Decimal] = None
+        self._last_ticker_time: float = 0
+
+        # Fill tracking — asyncio.Event per client_order_id
+        self._pending_fills: dict[str, asyncio.Event] = {}
+        self._fill_results: dict[str, dict] = {}
+
+        # Tick size (will be populated from market data)
+        self._tick_size: Decimal = Decimal("0.1")  # Default, updated on connect
+        self._ticker_format_logged: bool = False  # Log raw format once for debugging
+
+    # ========== Connection ==========
+
+    async def connect(self) -> None:
+        # Set environment variables required by grvt-pysdk
+        os.environ["GRVT_PRIVATE_KEY"] = self._private_key
+        os.environ["GRVT_API_KEY"] = self._api_key
+        os.environ["GRVT_TRADING_ACCOUNT_ID"] = self._trading_account_id
+        os.environ["GRVT_ENV"] = self._env
+
+        from pysdk.grvt_ccxt_ws import GrvtCcxtWS
+        from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+
+        params = {
+            "api_key": self._api_key,
+            "trading_account_id": self._trading_account_id,
+        }
+
+        env = GrvtEnv(self._env)
+        loop = asyncio.get_event_loop()
+        self._ws = GrvtCcxtWS(env, loop=loop, logger=logger, parameters=params)
+        await self._ws.initialize()
+        logger.info("GRVT WS initialized")
+
+        # Subscribe to mini ticker for BBO
+        await self._ws.subscribe(
+            stream="mini.s",
+            callback=self._on_mini_ticker,
+            ws_end_point_type=GrvtWSEndpointType.MARKET_DATA_RPC_FULL,
+            params={"instrument": self._symbol},
+        )
+        logger.info(f"Subscribed to GRVT mini ticker: {self._symbol}")
+
+        # Subscribe to order feed for fill detection (filtered by instrument)
+        await self._ws.subscribe(
+            stream="order",
+            callback=self._on_order_update,
+            ws_end_point_type=GrvtWSEndpointType.TRADE_DATA_RPC_FULL,
+            params={"instrument": self._symbol},
+        )
+        logger.info(f"Subscribed to GRVT order feed: {self._symbol}")
+
+        # Fetch tick size from market info
+        await self._fetch_tick_size()
+
+        # Wait for first BBO
+        for _ in range(100):  # 10s max
+            if self._best_bid is not None and self._best_ask is not None:
+                logger.info(f"GRVT BBO ready: bid={self._best_bid} ask={self._best_ask}")
+                return
+            await asyncio.sleep(0.1)
+        logger.warning("GRVT BBO not available within 10s, continuing")
+
+    async def disconnect(self) -> None:
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception as e:
+                logger.warning(f"GRVT WS close error: {e}")
+        self._ws = None
+        self._best_bid = None
+        self._best_ask = None
+        logger.info("GRVT disconnected")
+
+    async def _fetch_tick_size(self):
+        """Fetch tick size from GRVT market data."""
+        try:
+            if self._ws and hasattr(self._ws, 'markets') and self._ws.markets:
+                market = self._ws.markets.get(self._symbol)
+                if market:
+                    tick_size = market.get('precision', {}).get('price')
+                    if tick_size:
+                        self._tick_size = Decimal(str(tick_size))
+                        logger.info(f"GRVT tick size: {self._tick_size}")
+                        return
+            # Fallback defaults
+            if "BTC" in self._ticker:
+                self._tick_size = Decimal("0.1")
+            elif "ETH" in self._ticker:
+                self._tick_size = Decimal("0.01")
+            logger.info(f"GRVT tick size (fallback): {self._tick_size}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch GRVT tick size: {e}")
+
+    # ========== WS Callbacks ==========
+
+    def _on_mini_ticker(self, data: dict):
+        """Handle mini ticker updates for BBO."""
+        try:
+            # Log raw data format once for debugging
+            if not self._ticker_format_logged:
+                logger.info(f"GRVT mini ticker raw sample: {str(data)[:500]}")
+                self._ticker_format_logged = True
+
+            # GrvtCcxtWS mini ticker data structure
+            feed = data if isinstance(data, dict) else {}
+
+            # Try various field names the SDK might use
+            bid = feed.get("best_bid") or feed.get("bid") or feed.get("best_bid_price")
+            ask = feed.get("best_ask") or feed.get("ask") or feed.get("best_ask_price")
+
+            # Handle nested structure
+            if bid is None and "result" in feed:
+                result = feed["result"]
+                bid = result.get("best_bid") or result.get("bid")
+                ask = result.get("best_ask") or result.get("ask")
+
+            if bid is not None and ask is not None:
+                self._best_bid = Decimal(str(bid))
+                self._best_ask = Decimal(str(ask))
+                self._last_ticker_time = time.time()
+        except Exception as e:
+            logger.debug(f"Error parsing GRVT mini ticker: {e}, data={data}")
+
+    def _on_order_update(self, data: dict):
+        """Handle order feed updates for fill detection."""
+        try:
+            # Extract order data — SDK may wrap in various structures
+            order = data
+            if "result" in data:
+                order = data["result"]
+            if "feed" in order:
+                order = order["feed"]
+
+            client_order_id = str(order.get("client_order_id", ""))
+            status = str(order.get("status", "")).upper()
+
+            # Log all order updates for debugging
+            order_id = order.get("order_id", "?")
+            filled = order.get("filled_size", order.get("filled", "0"))
+            logger.debug(f"GRVT order update: id={order_id} cid={client_order_id} status={status} filled={filled}")
+
+            if client_order_id not in self._pending_fills:
+                return
+
+            filled_size = Decimal(str(order.get("filled_size", order.get("filled", "0"))))
+            price = Decimal(str(order.get("price", "0")))
+
+            if status == "FILLED":
+                self._fill_results[client_order_id] = {
+                    "filled_size": filled_size,
+                    "price": price,
+                    "status": "FILLED",
+                }
+                self._pending_fills[client_order_id].set()
+                logger.info(f"GRVT fill confirmed: cid={client_order_id} filled={filled_size} @ {price}")
+
+            elif status in ("REJECTED", "CANCELLED", "CANCELED"):
+                self._fill_results[client_order_id] = {
+                    "filled_size": filled_size,
+                    "price": price,
+                    "status": status,
+                }
+                self._pending_fills[client_order_id].set()
+                if filled_size > 0:
+                    logger.info(f"GRVT order {status} with partial fill: cid={client_order_id} filled={filled_size}")
+                else:
+                    logger.info(f"GRVT order {status}: cid={client_order_id}")
+
+        except Exception as e:
+            logger.error(f"Error handling GRVT order update: {e}, data={data}")
+
+    # ========== Public API ==========
+
+    def get_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        return self._best_bid, self._best_ask
+
+    def is_ws_stale(self) -> bool:
+        if self._last_ticker_time == 0:
+            return True
+        return (time.time() - self._last_ticker_time) > WS_STALE_THRESHOLD
+
+    async def place_post_only_order(self, side: str, price: Decimal, size: Decimal) -> str:
+        """Place post-only maker order. Returns client_order_id."""
+        if not self._ws:
+            raise RuntimeError("GRVT client not connected")
+
+        client_order_id = str(int(time.time() * 1_000_000))
+
+        # Register fill event BEFORE placing order
+        fill_event = asyncio.Event()
+        self._pending_fills[client_order_id] = fill_event
+
+        try:
+            result = await self._ws.rpc_create_order(
+                symbol=self._symbol,
+                order_type="limit",
+                side=side.lower(),
+                amount=float(size),
+                price=str(price),
+                params={
+                    "client_order_id": client_order_id,
+                    "post_only": True,
+                    "time_in_force": "GTT",
+                },
+            )
+
+            if not result:
+                self._pending_fills.pop(client_order_id, None)
+                raise RuntimeError("GRVT rpc_create_order returned empty result")
+
+            logger.info(f"GRVT post-only sent: cid={client_order_id} {side} {size} @ {price}")
+            return client_order_id
+
+        except Exception as e:
+            self._pending_fills.pop(client_order_id, None)
+            raise
+
+    async def wait_for_fill(self, client_order_id: str, timeout: float) -> Optional[dict]:
+        """Wait for fill event from WS. Returns fill data or None on timeout."""
+        event = self._pending_fills.get(client_order_id)
+        if not event:
+            return None
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return self._fill_results.pop(client_order_id, None)
+        except asyncio.TimeoutError:
+            logger.warning(f"GRVT fill timeout: cid={client_order_id} after {timeout}s")
+            return None
+        finally:
+            self._pending_fills.pop(client_order_id, None)
+
+    def get_last_fill(self, client_order_id: str) -> Optional[dict]:
+        """Get fill result if already available (for checking after cancel)."""
+        return self._fill_results.get(client_order_id)
+
+    async def cancel_order(self, client_order_id: str) -> bool:
+        """Cancel order by client_order_id."""
+        if not self._ws:
+            return False
+        try:
+            result = await self._ws.rpc_cancel_order(
+                id=client_order_id,
+                params={"client_order_id": client_order_id},
+            )
+            logger.info(f"GRVT cancel sent: cid={client_order_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"GRVT cancel failed: cid={client_order_id} error={e}")
+            return False
+
+    async def cancel_all_orders(self, market_id: str = "") -> None:
+        if not self._ws:
+            return
+        try:
+            await self._ws.rpc_cancel_all_orders(
+                params={"instrument": self._symbol},
+            )
+            logger.info(f"GRVT: all orders canceled for {self._symbol}")
+        except Exception as e:
+            logger.error(f"GRVT cancel_all_orders failed: {e}")
+
+    async def get_position(self, market_id: str = "") -> Decimal:
+        if not self._ws:
+            raise RuntimeError("GRVT not connected")
+        try:
+            positions = await self._ws.fetch_positions()
+            if positions:
+                for pos in positions:
+                    symbol = pos.get("symbol", "")
+                    if symbol == self._symbol:
+                        size = pos.get("contracts", pos.get("size", 0))
+                        side = pos.get("side", "")
+                        amount = Decimal(str(abs(float(size))))
+                        if side == "short":
+                            amount = -amount
+                        return amount
+            return Decimal("0")
+        except Exception as e:
+            logger.error(f"Failed to get GRVT position: {e}")
+            raise
+
+    async def get_balance(self) -> Decimal:
+        if not self._ws:
+            raise RuntimeError("GRVT not connected")
+        try:
+            balance = await self._ws.fetch_balance()
+            if balance and "free" in balance:
+                usdt = balance["free"].get("USDT", balance["free"].get("USD", 0))
+                return Decimal(str(usdt))
+            return Decimal("0")
+        except Exception as e:
+            logger.error(f"Failed to get GRVT balance: {e}")
+            raise
+
+    async def close_position(self, market_id: str, position: Decimal, slippage_pct: Decimal) -> bool:
+        if abs(position) == 0:
+            return True
+
+        # Close: sell if long, buy if short
+        if position > 0:
+            side = "sell"
+            if self._best_bid:
+                price = self._best_bid * (Decimal("1") - slippage_pct)
+            else:
+                logger.error("Cannot close GRVT: no bid")
+                return False
+        else:
+            side = "buy"
+            if self._best_ask:
+                price = self._best_ask * (Decimal("1") + slippage_pct)
+            else:
+                logger.error("Cannot close GRVT: no ask")
+                return False
+
+        close_size = abs(position)
+
+        try:
+            client_order_id = str(int(time.time() * 1_000_000))
+            fill_event = asyncio.Event()
+            self._pending_fills[client_order_id] = fill_event
+
+            result = await self._ws.rpc_create_order(
+                symbol=self._symbol,
+                order_type="limit",
+                side=side,
+                amount=float(close_size),
+                price=str(price),
+                params={
+                    "client_order_id": client_order_id,
+                    "time_in_force": "IOC",
+                    "reduce_only": True,
+                },
+            )
+
+            # Wait for fill
+            try:
+                await asyncio.wait_for(fill_event.wait(), timeout=15)
+                fill_data = self._fill_results.pop(client_order_id, None)
+                if fill_data and fill_data.get("filled_size", Decimal("0")) > 0:
+                    logger.info(f"GRVT close filled: {fill_data['filled_size']}")
+                    return True
+            except asyncio.TimeoutError:
+                logger.warning("GRVT close fill timeout")
+            finally:
+                self._pending_fills.pop(client_order_id, None)
+
+            return False
+        except Exception as e:
+            logger.error(f"GRVT close_position error: {e}")
+            return False
+
+    @property
+    def tick_size(self) -> Decimal:
+        return self._tick_size
+
+    @property
+    def symbol(self) -> str:
+        return self._symbol
