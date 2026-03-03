@@ -33,6 +33,8 @@ RECONNECT_BASE_DELAY = 1  # seconds
 RECONNECT_MAX_DELAY = 30  # seconds
 OB_CLEANUP_INTERVAL = 1000  # messages between cleanups
 OB_MAX_LEVELS = 100  # max levels per side
+CONNECT_READY_TIMEOUT = 10  # seconds
+SEND_ERROR_GRACE_TIMEOUT = 1.5  # seconds
 
 
 class LighterClient(BaseExchangeClient):
@@ -63,6 +65,7 @@ class LighterClient(BaseExchangeClient):
         self._ws_task: Optional[asyncio.Task] = None
         self._running = False
         self._last_ws_msg_time: float = 0
+        self._account_orders_ready = False
 
         # Orderbook state
         # Note: float keys are safe here because the WS API returns consistent
@@ -75,6 +78,7 @@ class LighterClient(BaseExchangeClient):
 
         # Fill tracking — asyncio.Event per client_order_index
         self._pending_fills: Dict[int, asyncio.Event] = {}
+        self._pending_fill_meta: Dict[int, dict] = {}
         self._fill_results: Dict[int, dict] = {}
 
     # ========== Connection ==========
@@ -103,13 +107,20 @@ class LighterClient(BaseExchangeClient):
         self._ws_task = asyncio.create_task(self._ws_loop())
         logger.info("Lighter WS task started")
 
-        # Wait for orderbook snapshot
-        for _ in range(100):  # 10 seconds max
-            if self._ob_snapshot_loaded:
-                logger.info("Lighter orderbook snapshot loaded")
+        # Wait for orderbook + private account_orders readiness.
+        deadline = time.time() + CONNECT_READY_TIMEOUT
+        while time.time() < deadline:
+            if self._ob_snapshot_loaded and self._account_orders_ready:
+                logger.info("Lighter orderbook + account_orders ready")
                 return
             await asyncio.sleep(0.1)
-        logger.warning("Lighter orderbook snapshot not loaded within 10s, continuing anyway")
+
+        missing = []
+        if not self._ob_snapshot_loaded:
+            missing.append("orderbook")
+        if not self._account_orders_ready:
+            missing.append("account_orders")
+        raise RuntimeError(f"Lighter connect not ready within {CONNECT_READY_TIMEOUT}s: missing {', '.join(missing)}")
 
     async def disconnect(self) -> None:
         self._running = False
@@ -126,6 +137,7 @@ class LighterClient(BaseExchangeClient):
                 pass
         if self._api_client:
             await self._api_client.close()
+        self._account_orders_ready = False
         logger.info("Lighter disconnected")
 
     async def _fetch_market_config(self):
@@ -173,7 +185,8 @@ class LighterClient(BaseExchangeClient):
                     }))
 
                     # Subscribe to account orders (private, needs auth)
-                    await self._subscribe_account_orders(ws)
+                    if not await self._subscribe_account_orders(ws):
+                        raise RuntimeError("Failed to subscribe account_orders")
 
                     # Start auth token rotation in background
                     rotation_task = asyncio.create_task(self._auth_rotation_loop(ws))
@@ -195,22 +208,25 @@ class LighterClient(BaseExchangeClient):
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
-    async def _subscribe_account_orders(self, ws):
+    async def _subscribe_account_orders(self, ws) -> bool:
         try:
             deadline = int(time.time() + AUTH_TOKEN_LIFETIME)
             auth_token, err = self._signer.create_auth_token_with_expiry(deadline)
             if err is not None:
                 logger.warning(f"Failed to create auth token: {err}")
-                return
+                return False
             channel = f"account_orders/{self._market_index}/{self._account_index}"
+            self._account_orders_ready = False
             await ws.send(json.dumps({
                 "type": "subscribe",
                 "channel": channel,
                 "auth": auth_token,
             }))
             logger.info(f"Subscribed to {channel} (auth expires in {AUTH_TOKEN_LIFETIME}s)")
+            return True
         except Exception as e:
             logger.warning(f"Failed to subscribe account_orders: {e}")
+            return False
 
     async def _auth_rotation_loop(self, ws):
         while True:
@@ -220,7 +236,8 @@ class LighterClient(BaseExchangeClient):
                 channel = f"account_orders/{self._market_index}/{self._account_index}"
                 await ws.send(json.dumps({"type": "unsubscribe", "channel": channel}))
                 await asyncio.sleep(0.5)
-                await self._subscribe_account_orders(ws)
+                if not await self._subscribe_account_orders(ws):
+                    raise RuntimeError("account_orders resubscribe failed")
                 logger.info("Auth token rotated successfully")
             except Exception as e:
                 logger.error(f"Auth rotation failed: {e}, forcing WS reconnect")
@@ -259,13 +276,22 @@ class LighterClient(BaseExchangeClient):
                 await ws.send(json.dumps({"type": "pong"}))
                 continue
 
+            channel = str(data.get("channel", ""))
+
             if msg_type == "subscribed/order_book":
                 await self._handle_ob_snapshot(data)
+            elif (
+                msg_type.startswith("subscribed/account_orders")
+                or (msg_type == "subscribed" and channel.startswith("account_orders/"))
+            ):
+                self._account_orders_ready = True
+                logger.info("Lighter account_orders subscription acknowledged")
             elif msg_type == "update/order_book" and self._ob_snapshot_loaded:
                 need_resync = await self._handle_ob_update(data)
                 if need_resync:
                     break  # Reconnect to get fresh snapshot
-            elif msg_type == "update/account_orders":
+            elif msg_type.startswith("update/account_orders"):
+                self._account_orders_ready = True
                 self._handle_account_orders(data)
 
             cleanup_counter += 1
@@ -281,6 +307,7 @@ class LighterClient(BaseExchangeClient):
             self._ob_offset = None
             self._ob_snapshot_loaded = False
             self._ob_sequence_gap = False
+            self._account_orders_ready = False
 
     async def _handle_ob_snapshot(self, data: dict):
         async with self._ob_lock:
@@ -374,12 +401,11 @@ class LighterClient(BaseExchangeClient):
 
                 filled_base = order.get("filled_base_amount", "0")
                 filled_quote = order.get("filled_quote_amount", "0")
-                filled_base_dec = Decimal(str(filled_base))
+                filled_base_dec = self._normalize_filled_base_amount(filled_base, client_order_idx)
                 filled_quote_dec = Decimal(str(filled_quote))
-
-                avg_price = Decimal("0")
-                if filled_base_dec > 0:
-                    avg_price = filled_quote_dec / filled_base_dec
+                avg_price = self._compute_avg_fill_price(
+                    filled_quote_dec, filled_base_dec, client_order_idx
+                )
 
                 if status == "FILLED" or (status == "CANCELED" and filled_base_dec > 0):
                     self._fill_results[client_order_idx] = {
@@ -437,6 +463,9 @@ class LighterClient(BaseExchangeClient):
     def is_orderbook_ready(self) -> bool:
         return self._ob_snapshot_loaded and bool(self._orderbook["bids"]) and bool(self._orderbook["asks"])
 
+    def is_account_orders_ready(self) -> bool:
+        return self._account_orders_ready
+
     def is_ws_stale(self) -> bool:
         if self._last_ws_msg_time == 0:
             return True
@@ -462,8 +491,7 @@ class LighterClient(BaseExchangeClient):
         client_order_index = int(time.time() * 1_000_000) % 1_000_000_000
 
         # Register fill event BEFORE sending order
-        fill_event = asyncio.Event()
-        self._pending_fills[client_order_index] = fill_event
+        self._register_pending_fill(client_order_index, size, price)
 
         try:
             tx_info, error = self._signer.sign_create_order(
@@ -478,7 +506,7 @@ class LighterClient(BaseExchangeClient):
                 trigger_price=0,
             )
             if error is not None:
-                self._pending_fills.pop(client_order_index, None)
+                self._clear_pending_fill(client_order_index)
                 raise RuntimeError(f"Lighter sign error: {error}")
 
             tx_hash = await self._signer.send_tx(
@@ -489,7 +517,9 @@ class LighterClient(BaseExchangeClient):
             return client_order_index
 
         except Exception as e:
-            self._pending_fills.pop(client_order_index, None)
+            recovered = await self._recover_submit_after_error(client_order_index, side, size, price, e)
+            if recovered:
+                return client_order_index
             raise
 
     async def wait_for_fill(self, client_order_index: int, timeout: float) -> Optional[dict]:
@@ -504,7 +534,7 @@ class LighterClient(BaseExchangeClient):
             logger.warning(f"Lighter fill timeout for idx={client_order_index} after {timeout}s")
             return None
         finally:
-            self._pending_fills.pop(client_order_index, None)
+            self._clear_pending_fill(client_order_index)
 
     async def get_position(self, market_id: str = "") -> Decimal:
         try:
@@ -573,8 +603,7 @@ class LighterClient(BaseExchangeClient):
         client_order_index = int(time.time() * 1_000_000) % 1_000_000_000
 
         # Register fill event BEFORE sending order (prevent race condition)
-        fill_event = asyncio.Event()
-        self._pending_fills[client_order_index] = fill_event
+        fill_event = self._register_pending_fill(client_order_index, close_size, price)
 
         try:
             tx_info, error = self._signer.sign_create_order(
@@ -589,7 +618,7 @@ class LighterClient(BaseExchangeClient):
                 trigger_price=0,
             )
             if error:
-                self._pending_fills.pop(client_order_index, None)
+                self._clear_pending_fill(client_order_index)
                 logger.error(f"Lighter close sign error: {error}")
                 return False
 
@@ -614,7 +643,112 @@ class LighterClient(BaseExchangeClient):
             logger.error(f"Lighter close_position error: {e}")
             return False
         finally:
-            self._pending_fills.pop(client_order_index, None)
+            self._clear_pending_fill(client_order_index)
+
+    def _register_pending_fill(
+        self,
+        client_order_index: int,
+        requested_size: Decimal,
+        requested_price: Optional[Decimal] = None,
+    ) -> asyncio.Event:
+        event = asyncio.Event()
+        self._pending_fills[client_order_index] = event
+        meta = {
+            "requested_size": Decimal(str(requested_size)),
+        }
+        if requested_price is not None:
+            meta["requested_price"] = Decimal(str(requested_price))
+        self._pending_fill_meta[client_order_index] = meta
+        return event
+
+    def _clear_pending_fill(self, client_order_index: int) -> None:
+        self._pending_fills.pop(client_order_index, None)
+        self._pending_fill_meta.pop(client_order_index, None)
+
+    def _normalize_filled_base_amount(self, raw_base, client_order_index: int) -> Decimal:
+        raw_dec = Decimal(str(raw_base))
+        if raw_dec <= 0:
+            return Decimal("0")
+
+        if self._base_amount_multiplier <= 1:
+            return raw_dec
+
+        scaled_dec = raw_dec / Decimal(self._base_amount_multiplier)
+        meta = self._pending_fill_meta.get(client_order_index) or {}
+        requested = meta.get("requested_size")
+        if requested is not None and requested > 0:
+            if abs(scaled_dec - requested) < abs(raw_dec - requested):
+                return scaled_dec
+
+        # Fallback heuristic for integer atomic amounts.
+        if raw_dec == raw_dec.to_integral_value() and raw_dec >= self._base_amount_multiplier:
+            return scaled_dec
+        return raw_dec
+
+    def _compute_avg_fill_price(
+        self,
+        raw_filled_quote: Decimal,
+        normalized_filled_base: Decimal,
+        client_order_index: int,
+    ) -> Decimal:
+        if normalized_filled_base <= 0:
+            return Decimal("0")
+
+        quote_candidates = [raw_filled_quote]
+        if (
+            self._price_multiplier > 1
+            and raw_filled_quote == raw_filled_quote.to_integral_value()
+            and raw_filled_quote >= self._price_multiplier
+        ):
+            quote_candidates.append(raw_filled_quote / Decimal(self._price_multiplier))
+
+        avg_candidates = [q / normalized_filled_base for q in quote_candidates if q >= 0]
+        if not avg_candidates:
+            return Decimal("0")
+        if len(avg_candidates) == 1:
+            return avg_candidates[0]
+
+        meta = self._pending_fill_meta.get(client_order_index) or {}
+        reference = meta.get("requested_price") or self._get_reference_price()
+        if reference is not None and reference > 0:
+            return min(avg_candidates, key=lambda p: abs(p - reference))
+
+        # Conservative fallback when no reference is available.
+        return min(avg_candidates)
+
+    def _get_reference_price(self) -> Optional[Decimal]:
+        bid, ask = self.get_bbo_unfiltered()
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2
+        return bid if bid is not None else ask
+
+    async def _recover_submit_after_error(
+        self,
+        client_order_index: int,
+        side: str,
+        size: Decimal,
+        price: Decimal,
+        error: Exception,
+    ) -> bool:
+        logger.error(
+            f"Lighter submit error for idx={client_order_index} ({side} {size} @ {price}): {error}. "
+            f"Waiting {SEND_ERROR_GRACE_TIMEOUT}s for late WS confirmation."
+        )
+        event = self._pending_fills.get(client_order_index)
+        if event is None:
+            return False
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=SEND_ERROR_GRACE_TIMEOUT)
+            if client_order_index in self._fill_results:
+                logger.warning(f"Lighter order likely accepted despite submit error: idx={client_order_index}")
+                return True
+        except asyncio.TimeoutError:
+            pass
+
+        self._clear_pending_fill(client_order_index)
+        self._fill_results.pop(client_order_index, None)
+        return False
 
     @property
     def tick_size(self) -> Decimal:

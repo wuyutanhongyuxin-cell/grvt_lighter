@@ -20,6 +20,7 @@ logger = logging.getLogger("arbitrage.grvt")
 MINI_TICKER_RATE = 100  # ms
 ORDER_DURATION = 300  # seconds — post-only order TTL
 WS_STALE_THRESHOLD = 30  # seconds
+SEND_ERROR_GRACE_TIMEOUT = 1.5  # seconds
 
 # Ticker mapping: our short names → GRVT symbol format
 TICKER_MAP = {
@@ -129,9 +130,9 @@ class GrvtClient(BaseExchangeClient):
             if self._ws and hasattr(self._ws, 'markets') and self._ws.markets:
                 market = self._ws.markets.get(self._symbol)
                 if market:
-                    tick_size = market.get('precision', {}).get('price')
-                    if tick_size:
-                        self._tick_size = Decimal(str(tick_size))
+                    parsed = self._parse_tick_size_from_market(market)
+                    if parsed is not None and parsed > 0:
+                        self._tick_size = parsed
                         logger.info(f"GRVT tick size: {self._tick_size}")
                         return
             # Fallback defaults
@@ -142,6 +143,46 @@ class GrvtClient(BaseExchangeClient):
             logger.info(f"GRVT tick size (fallback): {self._tick_size}")
         except Exception as e:
             logger.warning(f"Failed to fetch GRVT tick size: {e}")
+
+    @staticmethod
+    def _to_decimal(value) -> Optional[Decimal]:
+        try:
+            if value is None:
+                return None
+            return Decimal(str(value))
+        except Exception:
+            return None
+
+    @classmethod
+    def _parse_tick_size_from_market(cls, market: dict) -> Optional[Decimal]:
+        """Parse tick size robustly across different market schemas."""
+        if not isinstance(market, dict):
+            return None
+
+        # Prefer explicit tick/min-price style fields first.
+        candidates = [
+            market.get("tick_size"),
+            market.get("price_tick"),
+            market.get("limits", {}).get("price", {}).get("min"),
+            market.get("info", {}).get("tick_size"),
+            market.get("info", {}).get("price_tick"),
+        ]
+        for raw in candidates:
+            dec = cls._to_decimal(raw)
+            if dec is not None and dec > 0:
+                return dec
+
+        # Fallback: precision.price can be either decimal places (int)
+        # or direct tick size (fractional).
+        precision_price = market.get("precision", {}).get("price")
+        dec = cls._to_decimal(precision_price)
+        if dec is None or dec <= 0:
+            return None
+        if dec < 1:
+            return dec
+        if dec == dec.to_integral_value() and dec <= 12:
+            return Decimal("1").scaleb(-int(dec))
+        return None
 
     # ========== WS Callbacks ==========
 
@@ -257,15 +298,47 @@ class GrvtClient(BaseExchangeClient):
             )
 
             if not result:
-                self._pending_fills.pop(client_order_id, None)
                 raise RuntimeError("GRVT rpc_create_order returned empty result")
 
             logger.info(f"GRVT post-only sent: cid={client_order_id} {side} {size} @ {price}")
             return client_order_id
 
         except Exception as e:
-            self._pending_fills.pop(client_order_id, None)
+            # Some SDK/network errors happen after the order is already accepted.
+            # Keep tracking briefly to avoid losing the fill event in this race.
+            recovered = await self._recover_submit_after_error(client_order_id, side, size, price, e)
+            if recovered:
+                return client_order_id
             raise
+
+    async def _recover_submit_after_error(
+        self,
+        client_order_id: str,
+        side: str,
+        size: Decimal,
+        price: Decimal,
+        error: Exception,
+    ) -> bool:
+        logger.error(
+            f"GRVT submit error for cid={client_order_id} ({side} {size} @ {price}): {error}. "
+            f"Waiting {SEND_ERROR_GRACE_TIMEOUT}s for late WS confirmation."
+        )
+        event = self._pending_fills.get(client_order_id)
+        if event is None:
+            return False
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=SEND_ERROR_GRACE_TIMEOUT)
+            if client_order_id in self._fill_results:
+                logger.warning(f"GRVT order likely accepted despite submit error: cid={client_order_id}")
+                return True
+        except asyncio.TimeoutError:
+            pass
+
+        # No WS confirmation in grace window: clean up to avoid stale pending events.
+        self._pending_fills.pop(client_order_id, None)
+        self._fill_results.pop(client_order_id, None)
+        return False
 
     async def wait_for_fill(self, client_order_id: str, timeout: float) -> Optional[dict]:
         """Wait for fill event from WS. Returns fill data or None on timeout."""

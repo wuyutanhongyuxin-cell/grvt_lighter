@@ -147,6 +147,10 @@ class ArbStrategy:
             if loop_count % 200 == 0:
                 logger.warning("Lighter orderbook not ready")
             return
+        if not self.lighter_client.is_account_orders_ready():
+            if loop_count % 200 == 0:
+                logger.warning("Lighter account_orders stream not ready")
+            return
 
         # 2. Refresh BBO
         grvt_bid, grvt_ask = self.ob_manager.get_grvt_bbo()

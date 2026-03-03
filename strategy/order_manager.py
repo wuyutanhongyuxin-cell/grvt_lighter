@@ -31,6 +31,7 @@ logger = logging.getLogger("arbitrage.orders")
 # Constants
 POST_ONLY_MAX_RETRIES = 15
 LIGHTER_FILL_TIMEOUT = 30  # seconds
+VALID_DIRECTIONS = {"long_grvt", "short_grvt"}
 
 
 class OrderManager:
@@ -68,6 +69,10 @@ class OrderManager:
         self._executing = True
 
         try:
+            if direction not in VALID_DIRECTIONS:
+                logger.error(f"Invalid direction: {direction}")
+                return None
+
             # Determine sides
             if direction == "long_grvt":
                 grvt_side = "buy"

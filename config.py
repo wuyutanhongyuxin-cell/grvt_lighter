@@ -1,7 +1,7 @@
 import argparse
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
@@ -83,6 +83,8 @@ class Config:
             errors.append("--long-threshold must be positive")
         if self.short_threshold <= 0:
             errors.append("--short-threshold must be positive")
+        if self.fill_timeout <= 0:
+            errors.append("--fill-timeout must be positive")
         if errors:
             for e in errors:
                 print(f"Config error: {e}", file=sys.stderr)
