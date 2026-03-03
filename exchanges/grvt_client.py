@@ -109,14 +109,47 @@ class GrvtClient(BaseExchangeClient):
         for _ in range(100):  # 10s max
             if self._best_bid is not None and self._best_ask is not None:
                 logger.info(f"GRVT BBO ready: bid={self._best_bid} ask={self._best_ask}")
-                return
+                break
             await asyncio.sleep(0.1)
-        logger.warning("GRVT BBO not available within 10s, continuing")
+        else:
+            logger.warning("GRVT BBO not available within 10s, continuing")
+
+        # Verify trade data channel is connected (critical for order fills)
+        await self._verify_trade_channels()
+
+    async def _verify_trade_channels(self) -> None:
+        """Check that trade data WS channels actually connected (cookie auth may silently fail)."""
+        if not self._ws:
+            return
+        try:
+            from pysdk.grvt_ccxt_env import GrvtWSEndpointType
+            tdg_open = self._ws.is_connection_open(GrvtWSEndpointType.TRADE_DATA_RPC_FULL)
+            cookie_ok = self._ws._cookie is not None
+            if not cookie_ok:
+                logger.error(
+                    "GRVT cookie authentication FAILED — trade data channels NOT connected. "
+                    "Order placement and fill detection will NOT work. "
+                    "Check GRVT_API_KEY and GRVT_PRIVATE_KEY in .env"
+                )
+            elif not tdg_open:
+                logger.error(
+                    "GRVT trade data WS (tdg_rpc_full) not connected despite valid cookie. "
+                    "Order feed subscription will not receive fill events."
+                )
+            else:
+                logger.info("GRVT trade data channel verified: connected and authenticated")
+        except Exception as e:
+            logger.warning(f"Could not verify GRVT trade channels: {e}")
 
     async def disconnect(self) -> None:
         if self._ws:
             try:
-                await self._ws.close()
+                from pysdk.grvt_ccxt_env import GrvtWSEndpointType
+                for ep in GrvtWSEndpointType:
+                    try:
+                        await self._ws._close_connection(ep)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.warning(f"GRVT WS close error: {e}")
         self._ws = None

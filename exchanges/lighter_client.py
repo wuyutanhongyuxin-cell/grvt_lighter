@@ -90,9 +90,8 @@ class LighterClient(BaseExchangeClient):
         # Initialize signer client
         self._signer = SignerClient(
             url=BASE_URL,
-            private_key=self._private_key,
             account_index=self._account_index,
-            api_key_index=self._api_key_index,
+            api_private_keys={self._api_key_index: self._private_key},
         )
         err = self._signer.check_client()
         if err is not None:
@@ -494,14 +493,14 @@ class LighterClient(BaseExchangeClient):
         self._register_pending_fill(client_order_index, size, price)
 
         try:
-            tx_info, error = self._signer.sign_create_order(
+            tx_type, tx_info, tx_hash_signed, error = self._signer.sign_create_order(
                 market_index=self._market_index,
                 client_order_index=client_order_index,
                 base_amount=int(size * self._base_amount_multiplier),
                 price=int(price * self._price_multiplier),
                 is_ask=is_ask,
                 order_type=self._signer.ORDER_TYPE_LIMIT,
-                time_in_force=self._signer.ORDER_TIME_IN_FORCE_FILL_OR_KILL,
+                time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=False,
                 trigger_price=0,
             )
@@ -509,10 +508,11 @@ class LighterClient(BaseExchangeClient):
                 self._clear_pending_fill(client_order_index)
                 raise RuntimeError(f"Lighter sign error: {error}")
 
-            tx_hash = await self._signer.send_tx(
-                tx_type=self._signer.TX_TYPE_CREATE_ORDER,
+            resp = await self._signer.send_tx(
+                tx_type=int(tx_type),
                 tx_info=tx_info,
             )
+            tx_hash = resp.tx_hash if resp else tx_hash_signed
             logger.info(f"Lighter IOC sent: idx={client_order_index} {side} {size} @ {price} tx={tx_hash}")
             return client_order_index
 
@@ -567,7 +567,7 @@ class LighterClient(BaseExchangeClient):
             # Calculate a far future timestamp for cancellation
             far_future_ms = int((time.time() + 28 * 24 * 3600) * 1000)
             _, _, error = await self._signer.cancel_all_orders(
-                market_index=self._market_index,
+                time_in_force=self._signer.CANCEL_ALL_TIF_IMMEDIATE,
                 timestamp_ms=far_future_ms,
             )
             if error:
@@ -606,14 +606,14 @@ class LighterClient(BaseExchangeClient):
         fill_event = self._register_pending_fill(client_order_index, close_size, price)
 
         try:
-            tx_info, error = self._signer.sign_create_order(
+            tx_type, tx_info, tx_hash_signed, error = self._signer.sign_create_order(
                 market_index=self._market_index,
                 client_order_index=client_order_index,
                 base_amount=int(close_size * self._base_amount_multiplier),
                 price=int(price * self._price_multiplier),
                 is_ask=is_ask,
                 order_type=self._signer.ORDER_TYPE_LIMIT,
-                time_in_force=self._signer.ORDER_TIME_IN_FORCE_FILL_OR_KILL,
+                time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=True,
                 trigger_price=0,
             )
@@ -622,8 +622,8 @@ class LighterClient(BaseExchangeClient):
                 logger.error(f"Lighter close sign error: {error}")
                 return False
 
-            tx_hash = await self._signer.send_tx(
-                tx_type=self._signer.TX_TYPE_CREATE_ORDER,
+            resp = await self._signer.send_tx(
+                tx_type=int(tx_type),
                 tx_info=tx_info,
             )
             logger.info(f"Lighter close order sent: {side} {close_size} @ {price}")
