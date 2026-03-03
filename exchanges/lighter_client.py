@@ -335,12 +335,17 @@ class LighterClient(BaseExchangeClient):
         new_offset = ob["offset"]
 
         async with self._ob_lock:
-            # Validate offset sequence
+            # Validate offset sequence — Lighter WS offsets are NOT strictly
+            # sequential; small gaps (3-20) are normal server behaviour.
             if self._ob_offset is not None:
                 expected = self._ob_offset + 1
                 if new_offset > expected:
-                    logger.warning(f"Lighter OB offset gap: expected {expected}, got {new_offset}")
-                    return True  # Need reconnect
+                    gap = new_offset - expected
+                    if gap > 50:
+                        logger.warning(f"Lighter OB offset LARGE gap: expected {expected}, got {new_offset} (gap={gap})")
+                        return True  # Need reconnect
+                    else:
+                        logger.debug(f"Lighter OB offset small gap ({gap}), accepting")
                 elif new_offset < expected:
                     return False  # Stale, ignore
             else:

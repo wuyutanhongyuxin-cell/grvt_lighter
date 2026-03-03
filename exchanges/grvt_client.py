@@ -227,18 +227,18 @@ class GrvtClient(BaseExchangeClient):
                 logger.info(f"GRVT mini ticker raw sample: {str(data)[:500]}")
                 self._ticker_format_logged = True
 
-            # GrvtCcxtWS mini ticker data structure
-            feed = data if isinstance(data, dict) else {}
+            # SDK passes the entire message; BBO lives inside data["feed"]
+            feed = data.get("feed", data) if isinstance(data, dict) else {}
 
             # Try various field names the SDK might use
-            bid = feed.get("best_bid") or feed.get("bid") or feed.get("best_bid_price")
-            ask = feed.get("best_ask") or feed.get("ask") or feed.get("best_ask_price")
+            bid = feed.get("best_bid_price") or feed.get("best_bid") or feed.get("bid")
+            ask = feed.get("best_ask_price") or feed.get("best_ask") or feed.get("ask")
 
-            # Handle nested structure
+            # Handle nested "result" wrapper (some SDK versions)
             if bid is None and "result" in feed:
                 result = feed["result"]
-                bid = result.get("best_bid") or result.get("bid")
-                ask = result.get("best_ask") or result.get("ask")
+                bid = result.get("best_bid_price") or result.get("best_bid") or result.get("bid")
+                ask = result.get("best_ask_price") or result.get("best_ask") or result.get("ask")
 
             if bid is not None and ask is not None:
                 self._best_bid = Decimal(str(bid))
