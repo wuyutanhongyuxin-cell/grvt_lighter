@@ -312,8 +312,11 @@ class LighterClient(BaseExchangeClient):
         async with self._ob_lock:
             self._orderbook = {"bids": {}, "asks": {}}
             ob = data.get("order_book", {})
-            if "offset" in ob:
-                self._ob_offset = ob["offset"]
+            # After snapshot, set offset to None so the first delta establishes
+            # the baseline.  Snapshot offset and delta offset are from different
+            # shards and a gap between them is expected (not an error).
+            self._ob_offset = None
+            self._ob_snapshot_offset = ob.get("offset")
 
             self._apply_updates("bids", ob.get("bids", []))
             self._apply_updates("asks", ob.get("asks", []))
@@ -321,7 +324,7 @@ class LighterClient(BaseExchangeClient):
 
             bid_count = len(self._orderbook["bids"])
             ask_count = len(self._orderbook["asks"])
-            logger.info(f"Lighter OB snapshot: {bid_count} bids, {ask_count} asks, offset={self._ob_offset}")
+            logger.info(f"Lighter OB snapshot: {bid_count} bids, {ask_count} asks, snapshot_offset={self._ob_snapshot_offset}")
 
     async def _handle_ob_update(self, data: dict) -> bool:
         """Returns True if reconnect needed."""
@@ -340,6 +343,9 @@ class LighterClient(BaseExchangeClient):
                     return True  # Need reconnect
                 elif new_offset < expected:
                     return False  # Stale, ignore
+            else:
+                # First delta after snapshot — accept as new baseline
+                logger.info(f"Lighter OB first delta after snapshot: offset={new_offset}")
 
             self._ob_offset = new_offset
             self._apply_updates("bids", ob.get("bids", []))
@@ -503,6 +509,7 @@ class LighterClient(BaseExchangeClient):
                 time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=False,
                 trigger_price=0,
+                order_expiry=0,
             )
             if error is not None:
                 self._clear_pending_fill(client_order_index)
@@ -564,11 +571,10 @@ class LighterClient(BaseExchangeClient):
         if not self._signer:
             return
         try:
-            # Calculate a far future timestamp for cancellation
-            far_future_ms = int((time.time() + 28 * 24 * 3600) * 1000)
+            # CANCEL_ALL_TIF_IMMEDIATE requires timestamp_ms=0
             _, _, error = await self._signer.cancel_all_orders(
                 time_in_force=self._signer.CANCEL_ALL_TIF_IMMEDIATE,
-                timestamp_ms=far_future_ms,
+                timestamp_ms=0,
             )
             if error:
                 logger.warning(f"Lighter cancel_all_orders error: {error}")
@@ -616,6 +622,7 @@ class LighterClient(BaseExchangeClient):
                 time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=True,
                 trigger_price=0,
+                order_expiry=0,
             )
             if error:
                 self._clear_pending_fill(client_order_index)
