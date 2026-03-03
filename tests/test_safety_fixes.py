@@ -253,7 +253,7 @@ class SafetyFixesTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertIn(cid, client._pending_fills)
 
-        client._on_order_update(
+        await client._on_order_update(
             {
                 "client_order_id": cid,
                 "status": "FILLED",

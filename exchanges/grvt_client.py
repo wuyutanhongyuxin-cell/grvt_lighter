@@ -186,7 +186,7 @@ class GrvtClient(BaseExchangeClient):
 
     # ========== WS Callbacks ==========
 
-    def _on_mini_ticker(self, data: dict):
+    async def _on_mini_ticker(self, data: dict):
         """Handle mini ticker updates for BBO."""
         try:
             # Log raw data format once for debugging
@@ -214,7 +214,7 @@ class GrvtClient(BaseExchangeClient):
         except Exception as e:
             logger.debug(f"Error parsing GRVT mini ticker: {e}, data={data}")
 
-    def _on_order_update(self, data: dict):
+    async def _on_order_update(self, data: dict):
         """Handle order feed updates for fill detection."""
         try:
             # Extract order data — SDK may wrap in various structures
