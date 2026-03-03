@@ -215,12 +215,16 @@ class LighterClient(BaseExchangeClient):
                 logger.warning(f"Failed to create auth token: {err}")
                 return False
             channel = f"account_orders/{self._market_index}/{self._account_index}"
-            self._account_orders_ready = False
             await ws.send(json.dumps({
                 "type": "subscribe",
                 "channel": channel,
                 "auth": auth_token,
             }))
+            # Mark ready immediately — Lighter WS does not send a
+            # "subscribed" ack for private channels.  If auth is actually
+            # invalid, fill events simply won't arrive and wait_for_fill
+            # timeout will catch it.
+            self._account_orders_ready = True
             logger.info(f"Subscribed to {channel} (auth expires in {AUTH_TOKEN_LIFETIME}s)")
             return True
         except Exception as e:
@@ -274,6 +278,10 @@ class LighterClient(BaseExchangeClient):
             if msg_type == "ping":
                 await ws.send(json.dumps({"type": "pong"}))
                 continue
+
+            # Debug: log any message related to account_orders or subscribed acks
+            if "account_orders" in msg or msg_type.startswith("subscribed"):
+                logger.debug(f"Lighter WS ack/acct msg: type={msg_type} data_keys={list(data.keys())} raw={msg[:300]}")
 
             channel = str(data.get("channel", ""))
 
