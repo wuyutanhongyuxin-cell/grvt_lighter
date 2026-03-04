@@ -42,7 +42,10 @@ async def main() -> int:
     def signal_handler(sig, frame):
         signal_state["count"] += 1
         if signal_state["count"] == 1:
-            logger.info(f"Received signal {sig}, requesting graceful stop...")
+            logger.info(
+                f"Received signal {sig}, requesting graceful stop... "
+                "Press Ctrl+C again to force exit."
+            )
             strategy.request_stop("signal")
             if main_task and not main_task.done():
                 main_task.cancel()

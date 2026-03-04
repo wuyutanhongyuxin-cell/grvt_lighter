@@ -30,7 +30,7 @@ logger = logging.getLogger("arbitrage.orders")
 
 # Constants
 POST_ONLY_MAX_RETRIES = 15
-LIGHTER_FILL_TIMEOUT = 30  # seconds
+LIGHTER_FILL_TIMEOUT = 8  # seconds (IOC should resolve quickly)
 CANCEL_CHECK_GRACE_TIMEOUT = 0.5  # seconds
 CANCEL_RPC_TIMEOUT = 2.0  # seconds
 POST_CANCEL_SETTLE_DELAY = 0.2  # seconds
@@ -382,6 +382,10 @@ class OrderManager:
                 else:
                     filled = max(-diff, Decimal("0"))
                 filled = min(filled, max_qty)  # physical cap
+                logger.info(
+                    f"Lighter snapshot attempt {attempt + 1}/3: "
+                    f"pre={pre_pos} post={post_pos} diff={diff} filled={filled}"
+                )
                 if filled > 0:
                     logger.info(
                         f"Lighter snapshot fill check: pre={pre_pos} post={post_pos} "

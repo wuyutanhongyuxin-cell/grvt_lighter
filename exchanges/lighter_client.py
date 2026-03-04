@@ -35,6 +35,24 @@ OB_CLEANUP_INTERVAL = 1000  # messages between cleanups
 OB_MAX_LEVELS = 100  # max levels per side
 CONNECT_READY_TIMEOUT = 10  # seconds
 SEND_ERROR_GRACE_TIMEOUT = 1.5  # seconds
+TERMINAL_ORDER_STATUSES = {
+    "FILLED",
+    "CANCELED",
+    "CANCELLED",
+    "REJECTED",
+    "EXPIRED",
+    "DONE",
+    "MATCHED",
+    "EXECUTED",
+}
+ACTIVE_ORDER_STATUSES = {
+    "NEW",
+    "OPEN",
+    "PENDING",
+    "WORKING",
+    "PARTIAL",
+    "PARTIALLY_FILLED",
+}
 
 
 class LighterClient(BaseExchangeClient):
@@ -400,9 +418,28 @@ class LighterClient(BaseExchangeClient):
 
     # ========== Account Orders (Fill Detection) ==========
 
+    def _iter_order_entries(self, payload):
+        """Yield order dicts from nested account_orders payloads."""
+        if isinstance(payload, dict):
+            if "client_order_index" in payload or "client_order_id" in payload:
+                yield payload
+            for value in payload.values():
+                yield from self._iter_order_entries(value)
+            return
+        if isinstance(payload, list):
+            for item in payload:
+                yield from self._iter_order_entries(item)
+
+    @staticmethod
+    def _pick_numeric_field(order: dict, keys: tuple[str, ...], default: str = "0") -> str:
+        for key in keys:
+            value = order.get(key)
+            if value is not None:
+                return str(value)
+        return default
+
     def _handle_account_orders(self, data: dict):
-        orders = data.get("orders", {}).get(str(self._market_index), [])
-        for order in orders:
+        for order in self._iter_order_entries(data.get("orders", {})):
             try:
                 client_order_idx = order.get("client_order_index")
                 if client_order_idx is None:
@@ -417,15 +454,24 @@ class LighterClient(BaseExchangeClient):
                 if client_order_idx not in self._pending_fills:
                     continue
 
-                filled_base = order.get("filled_base_amount", "0")
-                filled_quote = order.get("filled_quote_amount", "0")
+                filled_base = self._pick_numeric_field(
+                    order,
+                    ("filled_base_amount", "filled_base", "filled_size", "executed_base_amount"),
+                )
+                filled_quote = self._pick_numeric_field(
+                    order,
+                    ("filled_quote_amount", "filled_quote", "executed_quote_amount"),
+                )
                 filled_base_dec = self._normalize_filled_base_amount(filled_base, client_order_idx)
                 filled_quote_dec = Decimal(str(filled_quote))
                 avg_price = self._compute_avg_fill_price(
                     filled_quote_dec, filled_base_dec, client_order_idx
                 )
 
-                if status == "FILLED" or (status == "CANCELED" and filled_base_dec > 0):
+                is_terminal = status in TERMINAL_ORDER_STATUSES
+                is_active = status in ACTIVE_ORDER_STATUSES
+
+                if (is_terminal and filled_base_dec > 0) or (filled_base_dec > 0 and not is_active):
                     self._fill_results[client_order_idx] = {
                         "filled_size": filled_base_dec,
                         "avg_price": avg_price,
@@ -437,14 +483,21 @@ class LighterClient(BaseExchangeClient):
                         f"Lighter fill confirmed: idx={client_order_idx} "
                         f"filled={filled_base_dec} @ {avg_price} status={status}"
                     )
-                elif status == "CANCELED" and filled_base_dec == 0:
+                elif is_terminal and filled_base_dec == 0:
                     self._fill_results[client_order_idx] = {
                         "filled_size": Decimal("0"),
                         "avg_price": Decimal("0"),
-                        "status": "CANCELED",
+                        "status": status or "CANCELED",
                     }
                     self._pending_fills[client_order_idx].set()
-                    logger.warning(f"Lighter order canceled with zero fill: idx={client_order_idx}")
+                    logger.warning(
+                        f"Lighter order terminal with zero fill: idx={client_order_idx} status={status}"
+                    )
+                else:
+                    logger.debug(
+                        f"Lighter order update pending: idx={client_order_idx} "
+                        f"status={status} filled={filled_base_dec}"
+                    )
 
             except Exception as e:
                 logger.error(f"Error handling Lighter order update: {e}")

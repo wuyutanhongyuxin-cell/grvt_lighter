@@ -445,3 +445,31 @@ class SafetyFixesTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._fill_results[idx]["filled_size"], Decimal("1.5"))
         self.assertEqual(client._fill_results[idx]["avg_price"], Decimal("2"))
         client._running = False
+
+    def test_lighter_handle_account_orders_accepts_nested_terminal_payload(self):
+        if LighterClient is None:
+            self.skipTest(f"LighterClient import failed: {LIGHTER_IMPORT_ERROR}")
+        client = LighterClient("k", 1, 1, "BTC")
+        client._market_index = 1
+
+        idx = 77
+        client._register_pending_fill(idx, Decimal("0.5"), Decimal("2"))
+        client._handle_account_orders(
+            {
+                "orders": {
+                    "1": {
+                        "bucket": [
+                            {
+                                "client_order_index": idx,
+                                "status": "DONE",
+                                "filled_size": "0.5",
+                                "executed_quote_amount": "1.0",
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+        self.assertIn(idx, client._fill_results)
+        self.assertEqual(client._fill_results[idx]["filled_size"], Decimal("0.5"))
+        self.assertEqual(client._fill_results[idx]["avg_price"], Decimal("2"))
