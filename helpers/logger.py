@@ -12,6 +12,7 @@ def setup_logger(name: str = "arbitrage", level: str = "INFO", dashboard_mode: b
         return logger
 
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.propagate = False  # Prevent leaking to root logger (breaks Rich Dashboard)
 
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(name)-20s | %(message)s",
