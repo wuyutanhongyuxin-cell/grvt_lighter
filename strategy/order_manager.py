@@ -29,8 +29,8 @@ from strategy.position_tracker import PositionTracker
 logger = logging.getLogger("arbitrage.orders")
 
 # Constants
-POST_ONLY_MAX_RETRIES = 15
-LIGHTER_FILL_TIMEOUT = 8  # seconds (IOC should resolve quickly)
+POST_ONLY_MAX_RETRIES = 8
+LIGHTER_FILL_TIMEOUT = 2  # seconds (IOC fills instantly, just wait for WS before REST fallback)
 CANCEL_CHECK_GRACE_TIMEOUT = 0.5  # seconds
 CANCEL_RPC_TIMEOUT = 2.0  # seconds
 POST_CANCEL_SETTLE_DELAY = 0.2  # seconds
