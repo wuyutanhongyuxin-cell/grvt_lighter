@@ -74,6 +74,7 @@ class GrvtClient(BaseExchangeClient):
         from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
 
         params = {
+            "private_key": self._private_key,
             "api_key": self._api_key,
             "trading_account_id": self._trading_account_id,
         }
