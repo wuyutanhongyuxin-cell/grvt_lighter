@@ -92,6 +92,7 @@ class ArbStrategy:
         self._last_heartbeat: float = 0
         self._low_balance_first_check: Optional[float] = None
         self._last_signal_time: float = 0
+        self._order_halt_handled: bool = False
 
     async def initialize(self) -> None:
         logger.info("Initializing strategy...")
@@ -256,8 +257,22 @@ class ArbStrategy:
 
         # 9. Signal detection
         if self.order_manager.is_trading_halted:
-            if loop_count % 200 == 0:
-                logger.warning(f"Trading halted by order manager: {self.order_manager.halt_reason}")
+            halt_reason = self.order_manager.halt_reason or "UNKNOWN"
+            if not self._order_halt_handled:
+                self._order_halt_handled = True
+                msg = (
+                    f"Trading halted by order manager: {halt_reason}. "
+                    "Triggering emergency shutdown to flatten positions."
+                )
+                logger.error(msg)
+                await self.telegram.notify_emergency(
+                    f"{msg} GRVT={self.positions.grvt_position} "
+                    f"Lighter={self.positions.lighter_position} "
+                    f"net={self.positions.get_net_position()}"
+                )
+                self.request_stop(f"ORDER_MANAGER_{halt_reason}")
+            elif loop_count % 200 == 0:
+                logger.warning(f"Trading halted by order manager: {halt_reason}")
             return
 
         direction, spread_value = self.spread_analyzer.check_signal()
