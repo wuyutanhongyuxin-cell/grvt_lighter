@@ -127,18 +127,20 @@ class GrvtClient(BaseExchangeClient):
             tdg_open = self._ws.is_connection_open(GrvtWSEndpointType.TRADE_DATA_RPC_FULL)
             cookie_ok = self._ws._cookie is not None
             if not cookie_ok:
-                logger.error(
+                raise RuntimeError(
                     "GRVT cookie authentication FAILED — trade data channels NOT connected. "
                     "Order placement and fill detection will NOT work. "
                     "Check GRVT_API_KEY and GRVT_PRIVATE_KEY in .env"
                 )
             elif not tdg_open:
-                logger.error(
+                raise RuntimeError(
                     "GRVT trade data WS (tdg_rpc_full) not connected despite valid cookie. "
                     "Order feed subscription will not receive fill events."
                 )
             else:
                 logger.info("GRVT trade data channel verified: connected and authenticated")
+        except RuntimeError:
+            raise  # Re-raise our own auth failures
         except Exception as e:
             logger.warning(f"Could not verify GRVT trade channels: {e}")
 

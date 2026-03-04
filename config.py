@@ -40,7 +40,7 @@ class Config:
     @classmethod
     def from_env_and_args(cls, args: argparse.Namespace) -> "Config":
         env_path = Path(__file__).parent / ".env"
-        load_dotenv(env_path)
+        load_dotenv(env_path, override=True)
 
         config = cls(
             # GRVT
