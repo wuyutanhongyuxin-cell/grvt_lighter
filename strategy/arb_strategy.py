@@ -104,14 +104,15 @@ class ArbStrategy:
         await self.grvt_client.connect()
         await self.lighter_client.connect()
 
-        # Initial position load
+        # Initial position load — MUST succeed or abort startup
         try:
             self.positions.grvt_position = await self.grvt_client.get_position()
             self.positions.lighter_position = await self.lighter_client.get_position()
             logger.info(f"Initial positions: GRVT={self.positions.grvt_position} "
                         f"Lighter={self.positions.lighter_position}")
         except Exception as e:
-            logger.warning(f"Failed to load initial positions: {e}")
+            logger.error(f"FATAL: Failed to load initial positions: {e}")
+            raise RuntimeError(f"Cannot start without position data: {e}") from e
 
         await self.telegram.notify_start(
             self.config.ticker, self.config.order_quantity,
@@ -423,9 +424,13 @@ class ArbStrategy:
 
             await asyncio.sleep(5)  # Wait between attempts
 
-        # Final check
-        final_grvt = await self._safe_get_position(self.grvt_client)
-        final_lighter = await self._safe_get_position(self.lighter_client)
+        # Final check — use conservative fallback (never mask real positions with 0)
+        final_grvt = await self._final_position_check(
+            self.grvt_client, self.positions.grvt_position, "GRVT"
+        )
+        final_lighter = await self._final_position_check(
+            self.lighter_client, self.positions.lighter_position, "Lighter"
+        )
 
         if abs(final_grvt) >= min_size or abs(final_lighter) >= min_size:
             msg = f"POSITIONS NOT CLOSED! GRVT={final_grvt} Lighter={final_lighter}"
@@ -444,6 +449,19 @@ class ArbStrategy:
                 logger.error(f"Failed to get position after 3 attempts: {e}")
                 return Decimal("0")
         return Decimal("0")
+
+    async def _final_position_check(self, client, local_pos: Decimal, label: str) -> Decimal:
+        """Final check: API失败时用local tracker兜底，绝不返回0掩盖仓位。"""
+        api_pos = await self._safe_get_position(client)
+        if api_pos != Decimal("0"):
+            return api_pos
+        # API returned 0 — could be real 0 or API failure
+        # If local tracker also 0, genuinely no position
+        if local_pos == Decimal("0"):
+            return Decimal("0")
+        # API=0 but local!=0 → suspicious, use local as conservative estimate
+        logger.warning(f"{label} final check: API=0 but local={local_pos}, using local (conservative)")
+        return local_pos
 
     @staticmethod
     def _pick_position(api_pos: Decimal, local_pos: Decimal, label: str) -> Decimal:

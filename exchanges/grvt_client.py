@@ -630,7 +630,7 @@ class GrvtClient(BaseExchangeClient):
             try:
                 await asyncio.sleep(1)  # let order settle
                 remaining = await self.get_position()
-                if abs(remaining) < abs(position) * Decimal("0.5"):
+                if abs(remaining) < abs(position) * Decimal("0.10"):
                     logger.info(f"GRVT close confirmed via REST: remaining={remaining}")
                     return True
                 logger.warning(f"GRVT close not confirmed: remaining={remaining} (was {position})")

@@ -184,6 +184,7 @@ class OrderManager:
                             "price": price,  # approximate with order price
                             "status": "FILLED",
                         }
+                        self.grvt_client.clear_pending_fill(client_order_id)
                         logger.info(f"Fill confirmed via position snapshot: {filled_qty}")
                         break
 
@@ -293,9 +294,16 @@ class OrderManager:
             self.positions.update_lighter(lighter_side, lighter_filled_size)
 
             if lighter_filled_size < confirmed_fill_size:
-                logger.warning(
+                imbalance = confirmed_fill_size - lighter_filled_size
+                msg = (
                     f"Lighter partial fill: {lighter_filled_size}/{confirmed_fill_size} "
-                    f"— imbalance of {confirmed_fill_size - lighter_filled_size}"
+                    f"— imbalance of {imbalance}"
+                )
+                logger.error(msg)
+                self._trading_halted = True
+                self._halt_reason = "LIGHTER_PARTIAL_FILL"
+                await self.telegram.notify_emergency(
+                    f"LIGHTER PARTIAL FILL: {msg}. Trading halted."
                 )
 
             # Calculate captured spread
@@ -356,6 +364,14 @@ class OrderManager:
 
         except Exception as e:
             logger.error(f"Unexpected error in execute_arb: {e}", exc_info=True)
+            # If GRVT already filled, we have unhedged exposure → halt
+            if grvt_fill_data and grvt_fill_data.get("filled_size", Decimal("0")) > 0:
+                self._trading_halted = True
+                self._halt_reason = "POST_FILL_EXCEPTION"
+                await self.telegram.notify_emergency(
+                    f"Exception after GRVT fill! "
+                    f"filled={grvt_fill_data['filled_size']} err={e}"
+                )
             return None
         finally:
             self._executing = False
