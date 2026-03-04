@@ -616,7 +616,14 @@ class LighterClient(BaseExchangeClient):
             if account_data and account_data.accounts:
                 for pos in account_data.accounts[0].positions:
                     if pos.market_id == self._market_index:
-                        return Decimal(str(pos.position))
+                        abs_qty = Decimal(str(pos.position))
+                        # sign: 1=Long, -1=Short. position is always absolute.
+                        sign = int(pos.sign) if hasattr(pos, "sign") and pos.sign is not None else 1
+                        signed_pos = abs_qty * sign
+                        logger.debug(
+                            f"Lighter position: sign={sign} abs={abs_qty} → {signed_pos}"
+                        )
+                        return signed_pos
             return Decimal("0")
         except Exception as e:
             logger.error(f"Failed to get Lighter position: {e}")
