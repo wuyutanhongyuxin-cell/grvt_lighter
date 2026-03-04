@@ -35,11 +35,20 @@ async def main() -> int:
     logger.info("=" * 60)
 
     strategy = ArbStrategy(config)
+    main_task = asyncio.current_task()
+    signal_state = {"count": 0}
 
     # Signal handling
     def signal_handler(sig, frame):
-        logger.info(f"Received signal {sig}, requesting stop...")
-        strategy.request_stop("signal")
+        signal_state["count"] += 1
+        if signal_state["count"] == 1:
+            logger.info(f"Received signal {sig}, requesting graceful stop...")
+            strategy.request_stop("signal")
+            if main_task and not main_task.done():
+                main_task.cancel()
+            return
+        logger.warning(f"Received signal {sig} again, forcing immediate interrupt")
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, signal_handler)
     try:
@@ -50,14 +59,19 @@ async def main() -> int:
     try:
         await strategy.initialize()
         await strategy.run()
+    except asyncio.CancelledError:
+        logger.info("Main task cancelled by signal")
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received")
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        # Mask further Ctrl+C during shutdown (prevent double interrupt)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        # During shutdown, allow Ctrl+C to force abort.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        except (OSError, AttributeError):
+            pass
 
         logger.info(f"Starting graceful shutdown (timeout={SHUTDOWN_TIMEOUT}s)...")
         try:

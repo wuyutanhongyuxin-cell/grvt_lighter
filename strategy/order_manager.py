@@ -31,7 +31,9 @@ logger = logging.getLogger("arbitrage.orders")
 # Constants
 POST_ONLY_MAX_RETRIES = 15
 LIGHTER_FILL_TIMEOUT = 30  # seconds
-CANCEL_CHECK_GRACE_TIMEOUT = 1.0  # seconds
+CANCEL_CHECK_GRACE_TIMEOUT = 0.5  # seconds
+CANCEL_RPC_TIMEOUT = 2.0  # seconds
+POST_CANCEL_SETTLE_DELAY = 0.2  # seconds
 VALID_DIRECTIONS = {"long_grvt", "short_grvt"}
 
 
@@ -142,10 +144,17 @@ class OrderManager:
                 if grvt_fill_data is None:
                     # Timeout => uncertain state. Run cancel-check + short reconcile window.
                     logger.info(f"GRVT fill timeout, entering cancel-check cid={client_order_id}")
-                    cancel_ok = await self.grvt_client.cancel_order(client_order_id)
+                    try:
+                        cancel_ok = await asyncio.wait_for(
+                            self.grvt_client.cancel_order(client_order_id),
+                            timeout=CANCEL_RPC_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        cancel_ok = False
+                        logger.warning(f"GRVT cancel rpc timeout: cid={client_order_id}")
                     if not cancel_ok:
                         logger.warning(f"GRVT cancel failed/uncertain: cid={client_order_id}")
-                    await asyncio.sleep(0.5)  # Let cancel process
+                    await asyncio.sleep(POST_CANCEL_SETTLE_DELAY)  # Let cancel process
 
                     # Check if partial fill came through before/during cancel
                     grvt_fill_data = self.grvt_client.get_last_fill(client_order_id)
@@ -394,7 +403,7 @@ class OrderManager:
         diff IS the amount we need to hedge (multiple retries may have filled
         before the slow GRVT API reflects them).
         """
-        for attempt in range(5):
+        for attempt in range(3):
             try:
                 post_pos = await self.grvt_client.get_position()
                 diff = post_pos - pre_pos
@@ -410,7 +419,7 @@ class OrderManager:
                     return filled
             except Exception as e:
                 logger.warning(f"Snapshot fill check attempt {attempt + 1} failed: {e}")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.35)
         return Decimal("0")
 
     @property
