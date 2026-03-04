@@ -142,18 +142,18 @@ class OrderManager:
                 )
 
                 if grvt_fill_data is None:
-                    # Timeout => uncertain state. Run cancel-check + short reconcile window.
-                    logger.info(f"GRVT fill timeout, entering cancel-check cid={client_order_id}")
+                    # Timeout => uncertain state. Cancel ALL orders (not just this one)
+                    # to kill any ghost orders from previous retries too.
+                    logger.info(f"GRVT fill timeout, canceling all orders (cid={client_order_id})")
                     try:
-                        cancel_ok = await asyncio.wait_for(
-                            self.grvt_client.cancel_order(client_order_id),
+                        await asyncio.wait_for(
+                            self.grvt_client.cancel_all_orders(),
                             timeout=CANCEL_RPC_TIMEOUT,
                         )
                     except asyncio.TimeoutError:
-                        cancel_ok = False
-                        logger.warning(f"GRVT cancel rpc timeout: cid={client_order_id}")
-                    if not cancel_ok:
-                        logger.warning(f"GRVT cancel failed/uncertain: cid={client_order_id}")
+                        logger.warning("GRVT cancel_all rpc timeout")
+                    except Exception as e:
+                        logger.warning(f"GRVT cancel_all failed: {e}")
                     await asyncio.sleep(POST_CANCEL_SETTLE_DELAY)  # Let cancel process
 
                     # Check if partial fill came through before/during cancel
@@ -166,7 +166,9 @@ class OrderManager:
                     else:
                         self.grvt_client.clear_pending_fill(client_order_id)
                     if grvt_fill_data and grvt_fill_data["filled_size"] > 0:
-                        logger.info(f"Partial fill detected after cancel: {grvt_fill_data['filled_size']}")
+                        filled = min(grvt_fill_data["filled_size"], self.order_quantity)
+                        grvt_fill_data["filled_size"] = filled
+                        logger.info(f"Partial fill detected after cancel: {filled}")
                         break
 
                     # WS didn't report fill → REST position snapshot fallback
@@ -174,6 +176,9 @@ class OrderManager:
                         pre_pos_grvt, grvt_side
                     )
                     if filled_qty > 0:
+                        # Cap at order_quantity: only hedge what THIS trade intended.
+                        # Ghost orders from earlier retries are absorbed by pre_pos refresh.
+                        filled_qty = min(filled_qty, self.order_quantity)
                         grvt_fill_data = {
                             "filled_size": filled_qty,
                             "price": price,  # approximate with order price
@@ -182,7 +187,13 @@ class OrderManager:
                         logger.info(f"Fill confirmed via position snapshot: {filled_qty}")
                         break
 
-                    # No fill at all — retry with fresh BBO
+                    # No fill at all — refresh pre_pos to absorb any ghost fills
+                    # from earlier retries before next iteration.
+                    try:
+                        pre_pos_grvt = await self.grvt_client.get_position()
+                        logger.debug(f"Pre-pos refreshed for retry: {pre_pos_grvt}")
+                    except Exception:
+                        pass  # keep old pre_pos on failure
                     logger.info(f"No fill, retry {retry + 1}/{POST_ONLY_MAX_RETRIES}")
                     continue
 
