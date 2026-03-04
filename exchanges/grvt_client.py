@@ -509,17 +509,28 @@ class GrvtClient(BaseExchangeClient):
                 },
             )
 
-            # Wait for fill
+            # Wait for fill via WS
             try:
                 await asyncio.wait_for(fill_event.wait(), timeout=15)
                 fill_data = self._fill_results.pop(client_order_id, None)
                 if fill_data and fill_data.get("filled_size", Decimal("0")) > 0:
-                    logger.info(f"GRVT close filled: {fill_data['filled_size']}")
+                    logger.info(f"GRVT close filled via WS: {fill_data['filled_size']}")
                     return True
             except asyncio.TimeoutError:
-                logger.warning("GRVT close fill timeout")
+                logger.warning("GRVT close WS fill timeout, checking REST position...")
             finally:
                 self._pending_fills.pop(client_order_id, None)
+
+            # REST fallback: check if position actually closed
+            try:
+                await asyncio.sleep(1)  # let order settle
+                remaining = await self.get_position()
+                if abs(remaining) < abs(position) * Decimal("0.5"):
+                    logger.info(f"GRVT close confirmed via REST: remaining={remaining}")
+                    return True
+                logger.warning(f"GRVT close not confirmed: remaining={remaining} (was {position})")
+            except Exception as e:
+                logger.warning(f"GRVT close REST check failed: {e}")
 
             return False
         except Exception as e:

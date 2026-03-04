@@ -198,6 +198,9 @@ class OrderManager:
             grvt_fill_price = grvt_fill_data.get("price", Decimal("0"))
             logger.info(f"GRVT confirmed: {grvt_side} {confirmed_fill_size} @ {grvt_fill_price}")
 
+            # Record Lighter pre-position for Phase 4 snapshot fallback
+            pre_pos_lighter = self.positions.lighter_position
+
             # ============ Phase 3: Lighter IOC order ============
             # CRITICAL: size = confirmed_fill_size, NOT order_quantity
             logger.info(f"=== PHASE 3: Lighter IOC {lighter_side} {confirmed_fill_size} ===")
@@ -228,20 +231,38 @@ class OrderManager:
             )
 
             if lighter_fill_data is None:
-                # CRITICAL: Lighter fill unknown — assume ZERO fill (safe default)
-                logger.error(
-                    f"LIGHTER FILL TIMEOUT! GRVT {grvt_side} {confirmed_fill_size}@{grvt_fill_price} "
-                    f"confirmed, Lighter {lighter_side} status UNKNOWN"
+                # WS didn't report fill → REST position snapshot fallback
+                logger.warning(
+                    f"Lighter WS fill timeout, checking REST snapshot "
+                    f"(pre_pos={pre_pos_lighter})"
                 )
-                self.positions.update_grvt(grvt_side, confirmed_fill_size)
-                # Don't update lighter position (we don't know if it filled)
-                self._trading_halted = True
-                self._halt_reason = "HEDGE_FILL_UNKNOWN"
-                await self.telegram.notify_emergency(
-                    f"LIGHTER FILL TIMEOUT: GRVT {grvt_side} {confirmed_fill_size} confirmed, "
-                    f"Lighter {lighter_side} fill unknown after {LIGHTER_FILL_TIMEOUT}s"
+                lighter_filled_qty = await self._get_lighter_filled_qty_from_snapshot(
+                    pre_pos_lighter, lighter_side, confirmed_fill_size,
                 )
-                return None
+                if lighter_filled_qty > 0:
+                    # Lighter DID fill, construct fill_data from snapshot
+                    lighter_bid, lighter_ask = self.lighter_client.get_bbo_unfiltered()
+                    est_price = lighter_bid if lighter_side == "sell" else lighter_ask
+                    lighter_fill_data = {
+                        "filled_size": lighter_filled_qty,
+                        "avg_price": est_price or Decimal("0"),
+                        "status": "FILLED",
+                    }
+                    logger.info(f"Lighter fill confirmed via snapshot: {lighter_filled_qty}")
+                else:
+                    # Genuinely unknown
+                    logger.error(
+                        f"LIGHTER FILL TIMEOUT! GRVT {grvt_side} {confirmed_fill_size}@{grvt_fill_price} "
+                        f"confirmed, Lighter {lighter_side} status UNKNOWN"
+                    )
+                    self.positions.update_grvt(grvt_side, confirmed_fill_size)
+                    self._trading_halted = True
+                    self._halt_reason = "HEDGE_FILL_UNKNOWN"
+                    await self.telegram.notify_emergency(
+                        f"LIGHTER FILL TIMEOUT: GRVT {grvt_side} {confirmed_fill_size} confirmed, "
+                        f"Lighter {lighter_side} fill unknown after {LIGHTER_FILL_TIMEOUT}s"
+                    )
+                    return None
 
             lighter_filled_size = lighter_fill_data.get("filled_size", Decimal("0"))
             lighter_fill_price = lighter_fill_data.get("avg_price", Decimal("0"))
@@ -338,6 +359,30 @@ class OrderManager:
             f"Lighter={self.positions.lighter_position} "
             f"net={self.positions.get_net_position()}"
         )
+
+    async def _get_lighter_filled_qty_from_snapshot(
+        self, pre_pos: Decimal, side: str, max_qty: Decimal,
+    ) -> Decimal:
+        """Detect Lighter fill via position snapshot diff."""
+        for attempt in range(3):
+            try:
+                post_pos = await self.lighter_client.get_position()
+                diff = post_pos - pre_pos
+                if side == "buy":
+                    filled = max(diff, Decimal("0"))
+                else:
+                    filled = max(-diff, Decimal("0"))
+                filled = min(filled, max_qty)  # physical cap
+                if filled > 0:
+                    logger.info(
+                        f"Lighter snapshot fill check: pre={pre_pos} post={post_pos} "
+                        f"diff={diff} filled={filled}"
+                    )
+                    return filled
+            except Exception as e:
+                logger.warning(f"Lighter snapshot fill check attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(0.5)
+        return Decimal("0")
 
     async def _get_filled_qty_from_snapshot(
         self, pre_pos: Decimal, side: str

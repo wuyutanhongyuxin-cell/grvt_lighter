@@ -601,6 +601,9 @@ class LighterClient(BaseExchangeClient):
         if abs(position) == 0:
             return True
 
+        # Cap slippage at 2% to avoid Lighter "accidental price" rejection
+        effective_slippage = min(slippage_pct, Decimal("0.02"))
+
         # Determine side: if long, sell to close; if short, buy to close
         if position > 0:
             side = "sell"
@@ -609,7 +612,7 @@ class LighterClient(BaseExchangeClient):
             if best_bid is None:
                 logger.error("Cannot close Lighter: no bid")
                 return False
-            price = best_bid * (Decimal("1") - slippage_pct)
+            price = best_bid * (Decimal("1") - effective_slippage)
         else:
             side = "buy"
             is_ask = False
@@ -617,7 +620,7 @@ class LighterClient(BaseExchangeClient):
             if best_ask is None:
                 logger.error("Cannot close Lighter: no ask")
                 return False
-            price = best_ask * (Decimal("1") + slippage_pct)
+            price = best_ask * (Decimal("1") + effective_slippage)
 
         close_size = abs(position)
         client_order_index = int(time.time() * 1_000_000) % 1_000_000_000
@@ -649,15 +652,26 @@ class LighterClient(BaseExchangeClient):
             )
             logger.info(f"Lighter close order sent: {side} {close_size} @ {price}")
 
-            # Wait for fill confirmation
+            # Wait for fill confirmation via WS
             try:
                 await asyncio.wait_for(fill_event.wait(), timeout=15)
                 result = self._fill_results.pop(client_order_index, None)
                 if result and result.get("filled_size", Decimal("0")) > 0:
-                    logger.info(f"Lighter close filled: {result['filled_size']}")
+                    logger.info(f"Lighter close filled via WS: {result['filled_size']}")
                     return True
             except asyncio.TimeoutError:
-                logger.warning("Lighter close fill timeout")
+                logger.warning("Lighter close WS fill timeout, checking REST position...")
+
+            # REST fallback: check if position actually closed
+            try:
+                await asyncio.sleep(1)  # let order settle
+                remaining = await self.get_position()
+                if abs(remaining) < abs(position) * Decimal("0.5"):
+                    logger.info(f"Lighter close confirmed via REST: remaining={remaining}")
+                    return True
+                logger.warning(f"Lighter close not confirmed: remaining={remaining} (was {position})")
+            except Exception as e:
+                logger.warning(f"Lighter close REST check failed: {e}")
 
             return False
         except Exception as e:
