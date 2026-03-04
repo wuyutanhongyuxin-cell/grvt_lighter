@@ -10,6 +10,7 @@
   <img src="https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/Async-asyncio-green" alt="Asyncio">
   <img src="https://img.shields.io/badge/Loop-50ms-orange" alt="50ms Loop">
+  <img src="https://img.shields.io/badge/Dashboard-Rich-purple?logo=gnu-bash&logoColor=white" alt="Rich Dashboard">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
 </p>
 
@@ -19,6 +20,7 @@
 
 - [概述 / Overview](#概述--overview)
 - [核心特性 / Features](#核心特性--features)
+- [终端 Dashboard / Terminal Dashboard](#终端-dashboard--terminal-dashboard)
 - [系统架构 / Architecture](#系统架构--architecture)
 - [交易流程 / Trade Lifecycle](#交易流程--trade-lifecycle)
 - [快速开始 / Quick Start](#快速开始--quick-start)
@@ -90,9 +92,70 @@
 - **Lighter fill 超时安全默认** — 未确认成交 = 视为零成交，宁漏不错
 
 ### 可观测性
+- **Rich 终端 Dashboard** — 全屏实时面板：健康状态、BBO、价差热力图、仓位、交易记录、事件日志
+- **双通道日志分离** — Dashboard 模式下日志只走文件（纯文本无 ANSI），终端留给面板
 - **Telegram 实时通知** — 启动、交易、心跳、紧急告警
 - **CSV 数据记录** — BBO 快照 + 完整交易记录
-- **多级日志系统** — 控制台 + 文件双输出，DEBUG/INFO/WARNING/ERROR
+- **多级日志系统** — 文件 DEBUG 全量记录，Dashboard WARNING+ 事件面板
+
+---
+
+## 终端 Dashboard / Terminal Dashboard
+
+默认启动时 Bot 会显示 Rich 全屏 Dashboard，包含 6 个实时面板：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  ⚡ LIGHTER × GRVT  ─  BTC-PERP    ⏱ 1:23:45    📊 42 trades     │
+├──────────┬──────────────────────────────┬───────────────────────────┤
+│ Health   │  BBO — Best Bid / Ask        │  Spread → Signal          │
+│          │                              │                           │
+│ GRVT     │      Bid        Ask   Spread │  LONG GRVT                │
+│ ● WS     │ GRVT  95001.2   95002.5  1.3 │  ▲ $  18.50 / $20       │
+│          │ Ltr   95005.3   95006.1  0.8 │  ━━━━━━━━━━━━━━━╌╌╌      │
+│ LIGHTER  │ Cross  Δ +4.1    Δ -3.6      │                           │
+│ ● WS     │                              │  SHORT GRVT               │
+│ ● OB     │                              │  △ $  16.20 / $20        │
+│ ● Acct   │                              │  ━━━━━━━━━━━━━╌╌╌╌╌      │
+├──────────┼──────────────────────────────┴───────────────────────────┤
+│ Positions│  Recent Trades                                           │
+│          │  Time   Dir   GRVT     Lighter  Size   Spread  P&L       │
+│ GRVT     │  14:23  LONG  $95001   $95005   0.001  $+4.00  $+0.0040 │
+│ +0.0010  │  14:20  SHORT $95010   $95006   0.001  $+4.00  $+0.0040 │
+│ Lighter  │  14:18  LONG  $95002   $95006   0.001  $+4.00  $+0.0040 │
+│ -0.0010  │                                                          │
+│ Net 0.00 │                                                          │
+├──────────┴──────────────────────────────────────────────────────────┤
+│ Event Log                                                           │
+│  14:23:01 ✦ long_grvt 0.001 spread=$4.00 pnl=$0.0040              │
+│  14:20:15 ⚠ GRVT WS stale, skipping trading                       │
+│  14:18:02 ✦ short_grvt 0.001 spread=$4.00 pnl=$0.0040             │
+├─────────────────────────────────────────────────────────────────────┤
+│  Ctrl+C exit  │ L=$20 S=$20 │ timeout=5s │ cooldown=2s             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 双通道设计
+
+```
+┌─────────────┐    ┌──────────────────────┐
+│  FileHandler │───▶│ logs/arbitrage_*.log │  纯文本，无 ANSI，可 tail -f
+│  (DEBUG+)    │    │ (完整结构化日志)      │
+└─────────────┘    └──────────────────────┘
+
+┌─────────────┐    ┌──────────────────────┐
+│  Dashboard   │───▶│ Terminal (stdout)    │  Rich 全屏面板
+│  (Rich Live) │    │ (实时可视化)          │
+└─────────────┘    └──────────────────────┘
+
+┌─────────────┐    ┌──────────────────────┐
+│  DataLogger  │───▶│ data/bbo_*.csv       │  CSV 不变
+│  (CSV)       │    │ data/trades_*.csv    │
+└─────────────┘    └──────────────────────┘
+```
+
+- **Dashboard 模式（默认）**：终端显示全屏面板，日志自动写入文件，**不再需要 `tee`**
+- **纯日志模式（`--no-dashboard`）**：和之前完全一样，适合调试、后台运行、`tee` 管道
 
 ---
 
@@ -116,7 +179,8 @@ arbitrage.py                    ← 入口：信号处理 + 优雅关机
     │   └── lighter_client.py   ← Lighter Taker 端（自定义 WS + lighter-sdk）
     │
     └── helpers/
-        ├── logger.py           ← 日志 + CSV 数据记录器
+        ├── dashboard.py        ← Rich 全屏 Dashboard（可选）
+        ├── logger.py           ← 日志（双模式）+ CSV 数据记录器
         └── telegram.py         ← Telegram 通知
 ```
 
@@ -246,26 +310,38 @@ TG_CHAT_ID=你的chat_id
 ### 4. 启动运行
 
 ```bash
-# BTC 套利，每单 0.001 BTC，最大仓位 0.01 BTC
-python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01
+# Dashboard 模式（默认）— 全屏实时面板
+python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 \
+    --long-threshold 20 --short-threshold 20
 
 # ETH 套利，自定义阈值
 python arbitrage.py --ticker ETH --size 0.01 --max-position 0.1 \
     --long-threshold 5 --short-threshold 5
 
-# 调试模式
-python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 \
+# 纯日志模式 — 调试 / 后台运行 / tee 管道
+python arbitrage.py --no-dashboard --ticker BTC --size 0.001 --max-position 0.01 \
     --log-level DEBUG
+
+# 纯日志 + tee 保存（适合远程调试）
+python arbitrage.py --no-dashboard --ticker BTC --size 0.001 --max-position 0.01 \
+    2>&1 | tee -a "logs/run_BTC_$(date +%F_%H%M%S).log"
+
+# 后台运行（推荐生产环境）
+nohup python arbitrage.py --no-dashboard --ticker BTC --size 0.001 --max-position 0.01 &
+# 日志自动写入 logs/arbitrage_*.log，不需要 tee
 ```
+
+> **Dashboard vs --no-dashboard**：Dashboard 模式下终端被全屏面板占用，日志只写入文件（`logs/arbitrage_*.log`），可用 `tail -f logs/arbitrage_*.log` 在另一个终端实时查看。`--no-dashboard` 模式日志同时输出到终端和文件，适合 `tee`、`nohup`、`screen` 等场景。
 
 ### 5. 停止运行
 
 按 `Ctrl+C` 触发优雅关机：
 1. 取消所有挂单
 2. 三轮递增滑点平仓（2% → 5% → 10%）
-3. 断开 WebSocket
-4. 发送 Telegram 停止通知
-5. 关闭数据文件
+3. 恢复终端（Dashboard 模式下自动退出全屏）
+4. 断开 WebSocket
+5. 发送 Telegram 停止通知
+6. 关闭数据文件
 
 ---
 
@@ -280,6 +356,7 @@ python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 \
 | `--short-threshold` | | `10` | Short 信号触发阈值（USD 绝对值） |
 | `--fill-timeout` | | `5` | GRVT Maker 成交等待超时（秒） |
 | `--log-level` | | `INFO` | 日志级别：`DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `--no-dashboard` | | `false` | 禁用 Rich Dashboard，使用纯文本日志输出 |
 
 ### 参数选择建议
 
@@ -444,7 +521,8 @@ grvt_lighter/
 │
 ├── helpers/
 │   ├── __init__.py
-│   ├── logger.py             # 日志 + CSV DataLogger
+│   ├── dashboard.py          # Rich 终端 Dashboard — 6 面板实时可视化
+│   ├── logger.py             # 日志（双模式：dashboard/plain）+ CSV DataLogger
 │   └── telegram.py           # Telegram 异步通知
 │
 ├── data/                     # (运行时生成) BBO + 交易 CSV

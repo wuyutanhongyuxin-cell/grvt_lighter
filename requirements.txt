@@ -3,3 +3,4 @@ lighter-sdk
 websockets>=12.0
 python-dotenv
 aiohttp>=3.9
+rich>=13.0

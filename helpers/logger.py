@@ -6,22 +6,27 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 
-def setup_logger(name: str = "arbitrage", level: str = "INFO") -> logging.Logger:
+def setup_logger(name: str = "arbitrage", level: str = "INFO", dashboard_mode: bool = False) -> logging.Logger:
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
 
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG)
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(name)-20s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    console_handler.setFormatter(fmt)
-    logger.addHandler(console_handler)
 
+    if not dashboard_mode:
+        # Plain mode: ConsoleHandler → stdout (tee-friendly)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(fmt)
+        logger.addHandler(console_handler)
+    # Dashboard mode: no ConsoleHandler — stdout is reserved for Rich Live
+
+    # FileHandler always present — log file stays clean
     log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_filename = os.path.join(log_dir, f"arbitrage_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")

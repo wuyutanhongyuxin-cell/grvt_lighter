@@ -21,7 +21,7 @@ async def main() -> int:
     args = parse_args()
     config = Config.from_env_and_args(args)
 
-    root_logger = setup_logger("arbitrage", config.log_level)
+    root_logger = setup_logger("arbitrage", config.log_level, dashboard_mode=not config.no_dashboard)
     logger = logging.getLogger("arbitrage.main")
 
     logger.info("=" * 60)

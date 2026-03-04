@@ -35,6 +35,7 @@ class Config:
     signal_cooldown: Decimal = Decimal("0")
     fill_timeout: int = 5  # GRVT maker fill timeout (seconds)
     log_level: str = "INFO"
+    no_dashboard: bool = False
 
     @classmethod
     def from_env_and_args(cls, args: argparse.Namespace) -> "Config":
@@ -64,6 +65,7 @@ class Config:
             signal_cooldown=Decimal(args.signal_cooldown),
             fill_timeout=args.fill_timeout,
             log_level=args.log_level,
+            no_dashboard=args.no_dashboard,
         )
 
         config.validate()
@@ -114,4 +116,5 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--signal-cooldown", default="0", help="Signal cooldown in seconds (default: 0)")
     parser.add_argument("--fill-timeout", type=int, default=5, help="GRVT maker fill timeout in seconds (default: 5)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
+    parser.add_argument("--no-dashboard", action="store_true", help="Disable rich terminal dashboard, use plain log output")
     return parser.parse_args()

@@ -45,6 +45,7 @@ class OrderManager:
         telegram: TelegramNotifier,
         order_quantity: Decimal,
         fill_timeout: int,
+        dashboard=None,
     ):
         self.grvt_client = grvt_client
         self.lighter_client = lighter_client
@@ -53,6 +54,7 @@ class OrderManager:
         self.telegram = telegram
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
+        self.dashboard = dashboard
 
         self._executing = False
         self._trading_halted = False
@@ -270,6 +272,19 @@ class OrderManager:
                 f"est_profit=${profit_est:.4f} "
                 f"pos: GRVT={self.positions.grvt_position} Lighter={self.positions.lighter_position}"
             )
+
+            # Dashboard update
+            if self.dashboard:
+                self.dashboard.add_trade(
+                    direction=direction,
+                    grvt_price=grvt_fill_price,
+                    lighter_price=lighter_fill_price,
+                    size=confirmed_fill_size,
+                    spread=spread,
+                    profit_est=profit_est,
+                )
+                self.dashboard.add_event("TRADE",
+                    f"{direction} {confirmed_fill_size} spread=${spread:.4f} pnl=${profit_est:.4f}")
 
             # Notify
             await self.telegram.notify_trade(

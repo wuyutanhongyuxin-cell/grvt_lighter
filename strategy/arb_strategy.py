@@ -23,6 +23,7 @@ from typing import Optional
 from config import Config
 from exchanges.grvt_client import GrvtClient
 from exchanges.lighter_client import LighterClient
+from helpers.dashboard import Dashboard, DashboardLogHandler
 from helpers.logger import DataLogger
 from helpers.telegram import TelegramNotifier
 from strategy.order_book_manager import OrderBookManager
@@ -72,6 +73,9 @@ class ArbStrategy:
         self.data_logger = DataLogger(config.ticker)
         self.telegram = TelegramNotifier(config.tg_bot_token, config.tg_chat_id)
 
+        # Dashboard (optional)
+        self.dashboard = Dashboard(config) if not config.no_dashboard else None
+
         self.order_manager = OrderManager(
             grvt_client=self.grvt_client,
             lighter_client=self.lighter_client,
@@ -80,6 +84,7 @@ class ArbStrategy:
             telegram=self.telegram,
             order_quantity=config.order_quantity,
             fill_timeout=config.fill_timeout,
+            dashboard=self.dashboard,
         )
 
         # Timers
@@ -113,6 +118,14 @@ class ArbStrategy:
         )
 
         self._start_time = time.time()
+
+        # Start dashboard after logger is ready
+        if self.dashboard:
+            self.dashboard.start()
+            self.dashboard.start_time = self._start_time
+            handler = DashboardLogHandler(self.dashboard)
+            logging.getLogger("arbitrage").addHandler(handler)
+
         logger.info("Strategy initialized")
 
     async def run(self) -> None:
@@ -173,6 +186,28 @@ class ArbStrategy:
                 grvt_bid, grvt_ask, lighter_bid, lighter_ask,
                 stats["diff_long"], stats["diff_short"],
             )
+
+        # 4b. Dashboard update (~4Hz = every 12 iterations)
+        if self.dashboard and loop_count % 12 == 0:
+            stats = self.spread_analyzer.get_stats()
+            self.dashboard.update_bbo(
+                grvt_bid, grvt_ask, lighter_bid, lighter_ask,
+                stats["diff_long"], stats["diff_short"],
+            )
+            self.dashboard.update_positions(
+                self.positions.grvt_position,
+                self.positions.lighter_position,
+            )
+            self.dashboard.update_health(
+                grvt_ws_ok=not self.grvt_client.is_ws_stale(),
+                lighter_ws_ok=not self.lighter_client.is_ws_stale(),
+                lighter_ob_ok=self.lighter_client.is_orderbook_ready(),
+                lighter_acct_ok=self.lighter_client.is_account_orders_ready(),
+                trading_halted=self.order_manager.is_trading_halted,
+                halt_reason=self.order_manager.halt_reason,
+            )
+            self.dashboard.total_trades = self.order_manager.total_trades
+            self.dashboard.refresh()
 
         # 5. Periodic status log
         if loop_count % STATUS_LOG_INTERVAL == 0 and loop_count > 0:
@@ -299,6 +334,10 @@ class ArbStrategy:
         # Step 2: Close positions with escalating slippage
         logger.info("Step 2: Closing positions...")
         await self._close_all_positions()
+
+        # Stop dashboard before disconnect (restore terminal)
+        if self.dashboard:
+            self.dashboard.stop()
 
         # Step 3: Disconnect
         logger.info("Step 3: Disconnecting...")
