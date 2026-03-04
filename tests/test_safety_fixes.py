@@ -216,6 +216,29 @@ class SafetyFixesTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(GrvtClient._parse_tick_size_from_market({"precision": {"price": 20}}))
 
+    def test_grvt_extract_signed_position_keeps_negative_size(self):
+        pos = {
+            "instrument": "BTC_USDT_Perp",
+            "size": "-0.03",
+            "notional": "-2000",
+        }
+        self.assertEqual(GrvtClient._extract_signed_position(pos), Decimal("-0.03"))
+
+    def test_grvt_extract_signed_position_flips_by_notional_when_size_is_absolute(self):
+        pos = {
+            "instrument": "BTC_USDT_Perp",
+            "size": "0.03",
+            "notional": "-2000",
+        }
+        self.assertEqual(GrvtClient._extract_signed_position(pos), Decimal("-0.03"))
+
+    def test_grvt_matches_position_symbol_variants(self):
+        client = GrvtClient("k", "k", "k", "prod", "BTC")
+        self.assertTrue(client._matches_position_symbol({"instrument": "BTC_USDT_Perp"}))
+        self.assertTrue(client._matches_position_symbol({"symbol": "BTC-USDT_Perp"}))
+        self.assertTrue(client._matches_position_symbol({"market": "btc_usdt_perp"}))
+        self.assertFalse(client._matches_position_symbol({"instrument": "ETH_USDT_Perp"}))
+
     async def test_grvt_submit_error_recovery_path(self):
         client = GrvtClient("k", "k", "k", "prod", "BTC")
         cid = "1"
@@ -265,6 +288,29 @@ class SafetyFixesTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(late_fill)
         self.assertEqual(late_fill["filled_size"], Decimal("0.1"))
         self.assertNotIn(cid, client._pending_fills)
+
+    async def test_grvt_order_update_accepts_orders_wrapper(self):
+        client = GrvtClient("k", "k", "k", "prod", "BTC")
+        cid = "wrapper-1"
+        client._pending_fills[cid] = asyncio.Event()
+        await client._on_order_update(
+            {
+                "result": {
+                    "orders": [
+                        {
+                            "metadata": {"client_order_id": cid},
+                            "status": "FILLED",
+                            "filled_size": "0.2",
+                            "price": "100.5",
+                        }
+                    ]
+                }
+            }
+        )
+        result = await client.wait_for_fill(cid, timeout=0.1)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["filled_size"], Decimal("0.2"))
+        self.assertEqual(result["price"], Decimal("100.5"))
 
     async def test_order_manager_halts_trading_after_hedge_submit_failure(self):
         manager = OrderManager(

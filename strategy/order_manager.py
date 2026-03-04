@@ -390,9 +390,11 @@ class OrderManager:
         """Detect fill via position snapshot diff (01-lighter pattern).
 
         Compares pre-order position with current API position.
-        Returns confirmed fill quantity, capped at order_quantity.
+        Returns confirmed fill quantity.  No artificial cap — the position
+        diff IS the amount we need to hedge (multiple retries may have filled
+        before the slow GRVT API reflects them).
         """
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 post_pos = await self.grvt_client.get_position()
                 diff = post_pos - pre_pos
@@ -400,7 +402,6 @@ class OrderManager:
                     filled = max(diff, Decimal("0"))
                 else:
                     filled = max(-diff, Decimal("0"))
-                filled = min(filled, self.order_quantity)  # physical cap
                 if filled > 0:
                     logger.info(
                         f"Snapshot fill check: pre={pre_pos} post={post_pos} "
@@ -409,7 +410,7 @@ class OrderManager:
                     return filled
             except Exception as e:
                 logger.warning(f"Snapshot fill check attempt {attempt + 1} failed: {e}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)
         return Decimal("0")
 
     @property

@@ -218,6 +218,53 @@ class GrvtClient(BaseExchangeClient):
             return Decimal("1").scaleb(-int(dec))
         return None
 
+    @staticmethod
+    def _normalize_symbol(value: str) -> str:
+        """Normalize symbol/instrument strings for robust matching."""
+        return str(value or "").strip().replace("-", "_").upper()
+
+    def _matches_position_symbol(self, pos: dict) -> bool:
+        """Match position payload symbol across schema variants."""
+        expected = self._normalize_symbol(self._symbol)
+        candidates = (
+            pos.get("instrument"),
+            pos.get("symbol"),
+            pos.get("market"),
+            pos.get("ticker"),
+        )
+        return any(self._normalize_symbol(raw) == expected for raw in candidates if raw)
+
+    @classmethod
+    def _extract_signed_position(cls, pos: dict) -> Decimal:
+        """Extract signed position size from mixed schemas."""
+        signed_size: Optional[Decimal] = None
+        for key in ("size", "contracts", "positionAmt", "position_amt", "qty", "quantity"):
+            if key not in pos:
+                continue
+            dec = cls._to_decimal(pos.get(key))
+            if dec is not None:
+                signed_size = dec
+                break
+
+        if signed_size is None:
+            return Decimal("0")
+
+        side = str(pos.get("side", "")).strip().lower()
+        notional = cls._to_decimal(pos.get("notional"))
+
+        if side in ("short", "sell") and signed_size > 0:
+            signed_size = -signed_size
+        elif side in ("long", "buy") and signed_size < 0:
+            logger.warning(
+                f"GRVT position side conflicts with signed size: side={side} size={signed_size}"
+            )
+        elif side == "" and signed_size != 0 and notional is not None and notional != 0:
+            # Some payloads use absolute size with signed notional.
+            if signed_size * notional < 0:
+                signed_size = -signed_size
+
+        return signed_size
+
     # ========== WS Callbacks ==========
 
     async def _on_mini_ticker(self, data: dict):
@@ -252,46 +299,81 @@ class GrvtClient(BaseExchangeClient):
         """Handle order feed updates for fill detection."""
         try:
             # Extract order data — SDK may wrap in various structures
-            order = data
-            if "result" in data:
-                order = data["result"]
-            if "feed" in order:
-                order = order["feed"]
+            payload = data.get("result", data) if isinstance(data, dict) else data
+            entries = []
+            if isinstance(payload, dict):
+                if "feed" in payload and isinstance(payload["feed"], dict):
+                    entries.append(payload["feed"])
+                if "orders" in payload:
+                    orders = payload["orders"]
+                    if isinstance(orders, list):
+                        entries.extend([o for o in orders if isinstance(o, dict)])
+                    elif isinstance(orders, dict):
+                        for value in orders.values():
+                            if isinstance(value, list):
+                                entries.extend([o for o in value if isinstance(o, dict)])
+                            elif isinstance(value, dict):
+                                entries.append(value)
+                if not entries:
+                    entries.append(payload)
+            elif isinstance(payload, list):
+                entries.extend([o for o in payload if isinstance(o, dict)])
 
-            client_order_id = str(order.get("client_order_id", ""))
-            status = str(order.get("status", "")).upper()
+            for order in entries:
+                client_order_id = str(
+                    order.get("client_order_id")
+                    or order.get("metadata", {}).get("client_order_id")
+                    or ""
+                )
+                if not client_order_id:
+                    continue
 
-            # Log all order updates for debugging
-            order_id = order.get("order_id", "?")
-            filled = order.get("filled_size", order.get("filled", "0"))
-            logger.debug(f"GRVT order update: id={order_id} cid={client_order_id} status={status} filled={filled}")
+                status = str(order.get("status", "")).upper()
 
-            if client_order_id not in self._pending_fills:
-                return
+                # Log all order updates for debugging
+                order_id = order.get("order_id", "?")
+                filled = order.get("filled_size", order.get("filled", "0"))
+                logger.debug(
+                    f"GRVT order update: id={order_id} cid={client_order_id} "
+                    f"status={status} filled={filled}"
+                )
 
-            filled_size = Decimal(str(order.get("filled_size", order.get("filled", "0"))))
-            price = Decimal(str(order.get("price", "0")))
+                if client_order_id not in self._pending_fills:
+                    continue
 
-            if status == "FILLED":
-                self._fill_results[client_order_id] = {
-                    "filled_size": filled_size,
-                    "price": price,
-                    "status": "FILLED",
-                }
-                self._pending_fills[client_order_id].set()
-                logger.info(f"GRVT fill confirmed: cid={client_order_id} filled={filled_size} @ {price}")
+                filled_size = Decimal(str(order.get("filled_size", order.get("filled", "0"))))
+                price = Decimal(
+                    str(
+                        order.get("price")
+                        or order.get("avg_price")
+                        or order.get("limit_price")
+                        or "0"
+                    )
+                )
 
-            elif status in ("REJECTED", "CANCELLED", "CANCELED"):
-                self._fill_results[client_order_id] = {
-                    "filled_size": filled_size,
-                    "price": price,
-                    "status": status,
-                }
-                self._pending_fills[client_order_id].set()
-                if filled_size > 0:
-                    logger.info(f"GRVT order {status} with partial fill: cid={client_order_id} filled={filled_size}")
-                else:
-                    logger.info(f"GRVT order {status}: cid={client_order_id}")
+                if status == "FILLED":
+                    self._fill_results[client_order_id] = {
+                        "filled_size": filled_size,
+                        "price": price,
+                        "status": "FILLED",
+                    }
+                    self._pending_fills[client_order_id].set()
+                    logger.info(f"GRVT fill confirmed: cid={client_order_id} filled={filled_size} @ {price}")
+
+                elif status in ("REJECTED", "CANCELLED", "CANCELED"):
+                    self._fill_results[client_order_id] = {
+                        "filled_size": filled_size,
+                        "price": price,
+                        "status": status,
+                    }
+                    self._pending_fills[client_order_id].set()
+                    if filled_size > 0:
+                        logger.info(
+                            f"GRVT order {status} with partial fill: "
+                            f"cid={client_order_id} filled={filled_size}"
+                        )
+                    else:
+                        logger.info(f"GRVT order {status}: cid={client_order_id}")
 
         except Exception as e:
             logger.error(f"Error handling GRVT order update: {e}, data={data}")
@@ -438,15 +520,16 @@ class GrvtClient(BaseExchangeClient):
             logger.debug(f"GRVT fetch_positions raw: {positions}")
             if positions:
                 for pos in positions:
-                    # GRVT SDK returns "instrument", not "symbol"
-                    symbol = pos.get("instrument", pos.get("symbol", ""))
-                    if symbol == self._symbol:
-                        size = pos.get("size", pos.get("contracts", 0))
+                    if self._matches_position_symbol(pos):
+                        symbol = pos.get("instrument", pos.get("symbol", self._symbol))
+                        size = pos.get("size", pos.get("contracts", ""))
                         side = pos.get("side", "")
-                        amount = Decimal(str(abs(float(size))))
-                        if side == "short":
-                            amount = -amount
-                        logger.debug(f"GRVT position matched: symbol={symbol} size={size} side={side} → {amount}")
+                        notional = pos.get("notional", "")
+                        amount = self._extract_signed_position(pos)
+                        logger.debug(
+                            "GRVT position matched: "
+                            f"symbol={symbol} size={size} side={side} notional={notional} -> {amount}"
+                        )
                         return amount
                 # No match found — log what we got for debugging
                 symbols_found = [pos.get("instrument", pos.get("symbol", "?")) for pos in positions]
