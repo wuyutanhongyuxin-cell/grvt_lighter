@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Optional, Tuple
 
 from .base import BaseExchangeClient
@@ -469,6 +469,21 @@ class GrvtClient(BaseExchangeClient):
             logger.error(f"Failed to get GRVT balance: {e}")
             raise
 
+    def _align_price_to_tick(self, price: Decimal, side: str) -> Decimal:
+        """Round price to tick_size boundary.
+
+        GRVT silently rejects orders with non-tick-aligned prices.
+        For sell: round DOWN (more aggressive, ensures fill).
+        For buy: round UP (more aggressive, ensures fill).
+        """
+        if side == "sell":
+            aligned = (price / self._tick_size).to_integral_value(rounding=ROUND_DOWN) * self._tick_size
+        else:
+            aligned = (price / self._tick_size).to_integral_value(rounding=ROUND_UP) * self._tick_size
+        if aligned != price:
+            logger.debug(f"Price aligned to tick: {price} → {aligned} (tick={self._tick_size})")
+        return aligned
+
     async def close_position(self, market_id: str, position: Decimal, slippage_pct: Decimal) -> bool:
         if abs(position) == 0:
             return True
@@ -489,6 +504,9 @@ class GrvtClient(BaseExchangeClient):
                 logger.error("Cannot close GRVT: no ask")
                 return False
 
+        # CRITICAL: align price to tick_size — GRVT silently rejects non-aligned prices
+        price = self._align_price_to_tick(price, side)
+
         close_size = abs(position)
 
         try:
@@ -496,6 +514,7 @@ class GrvtClient(BaseExchangeClient):
             fill_event = asyncio.Event()
             self._pending_fills[client_order_id] = fill_event
 
+            logger.info(f"GRVT close order: {side} {close_size} @ {price} (tick-aligned)")
             result = await self._ws.rpc_create_order(
                 symbol=self._symbol,
                 order_type="limit",
@@ -508,6 +527,7 @@ class GrvtClient(BaseExchangeClient):
                     "reduce_only": True,
                 },
             )
+            logger.info(f"GRVT close rpc result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
 
             # Wait for fill via WS
             try:
