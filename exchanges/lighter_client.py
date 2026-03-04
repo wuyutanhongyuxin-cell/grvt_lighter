@@ -574,7 +574,8 @@ class LighterClient(BaseExchangeClient):
             account_api = lighter.AccountApi(self._api_client)
             account_data = await account_api.account(by="index", value=str(self._account_index))
             if account_data and account_data.accounts:
-                return Decimal(str(account_data.accounts[0].free_collateral))
+                bal = account_data.accounts[0].available_balance
+                return Decimal(str(bal)) if bal is not None else Decimal("0")
             return Decimal("0")
         except Exception as e:
             logger.error(f"Failed to get Lighter balance: {e}")

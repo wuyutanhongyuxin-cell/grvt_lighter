@@ -326,7 +326,7 @@ class GrvtClient(BaseExchangeClient):
                 params={
                     "client_order_id": client_order_id,
                     "post_only": True,
-                    "time_in_force": "GTT",
+                    "time_in_force": "GOOD_TILL_TIME",
                 },
             )
 
@@ -497,7 +497,7 @@ class GrvtClient(BaseExchangeClient):
                 price=str(price),
                 params={
                     "client_order_id": client_order_id,
-                    "time_in_force": "IOC",
+                    "time_in_force": "IMMEDIATE_OR_CANCEL",
                     "reduce_only": True,
                 },
             )
