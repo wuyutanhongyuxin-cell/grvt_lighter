@@ -30,13 +30,12 @@ class SpreadAnalyzer:
         if any(v is None for v in (lighter_bid, lighter_ask, grvt_bid, grvt_ask)):
             return
 
-        # Long GRVT signal: Lighter willing to buy (bid) higher than GRVT bid
-        # → Buy on GRVT (maker), Sell on Lighter (taker)
-        self.diff_long = lighter_bid - grvt_bid
+        # Long GRVT signal: Buy on GRVT (maker, ≈grvt_ask), Sell on Lighter (taker, lighter_bid)
+        # Use cross-side prices that match actual execution
+        self.diff_long = lighter_bid - grvt_ask
 
-        # Short GRVT signal: GRVT ask lower than Lighter ask
-        # → Sell on GRVT (maker), Buy on Lighter (taker)
-        self.diff_short = grvt_ask - lighter_ask
+        # Short GRVT signal: Sell on GRVT (maker, ≈grvt_bid), Buy on Lighter (taker, lighter_ask)
+        self.diff_short = grvt_bid - lighter_ask
 
     def check_signal(self) -> Tuple[Optional[str], Decimal]:
         """

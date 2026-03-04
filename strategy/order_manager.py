@@ -399,10 +399,10 @@ class OrderManager:
         """Detect fill via position snapshot diff (01-lighter pattern).
 
         Compares pre-order position with current API position.
-        Returns confirmed fill quantity.  No artificial cap — the position
-        diff IS the amount we need to hedge (multiple retries may have filled
-        before the slow GRVT API reflects them).
+        Returns confirmed fill quantity, capped at the physical maximum
+        (order_quantity × POST_ONLY_MAX_RETRIES) to guard against API glitches.
         """
+        max_possible = self.order_quantity * POST_ONLY_MAX_RETRIES
         for attempt in range(3):
             try:
                 post_pos = await self.grvt_client.get_position()
@@ -411,6 +411,7 @@ class OrderManager:
                     filled = max(diff, Decimal("0"))
                 else:
                     filled = max(-diff, Decimal("0"))
+                filled = min(filled, max_possible)  # physical cap
                 if filled > 0:
                     logger.info(
                         f"Snapshot fill check: pre={pre_pos} post={post_pos} "

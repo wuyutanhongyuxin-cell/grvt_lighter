@@ -518,7 +518,7 @@ class LighterClient(BaseExchangeClient):
                 base_amount=int(size * self._base_amount_multiplier),
                 price=int(price * self._price_multiplier),
                 is_ask=is_ask,
-                order_type=self._signer.ORDER_TYPE_LIMIT,
+                order_type=self._signer.ORDER_TYPE_MARKET,
                 time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=False,
                 trigger_price=0,
@@ -601,9 +601,6 @@ class LighterClient(BaseExchangeClient):
         if abs(position) == 0:
             return True
 
-        # Cap slippage at 2% to avoid Lighter "accidental price" rejection
-        effective_slippage = min(slippage_pct, Decimal("0.02"))
-
         # Determine side: if long, sell to close; if short, buy to close
         if position > 0:
             side = "sell"
@@ -612,7 +609,7 @@ class LighterClient(BaseExchangeClient):
             if best_bid is None:
                 logger.error("Cannot close Lighter: no bid")
                 return False
-            price = best_bid * (Decimal("1") - effective_slippage)
+            price = best_bid * (Decimal("1") - slippage_pct)
         else:
             side = "buy"
             is_ask = False
@@ -620,7 +617,7 @@ class LighterClient(BaseExchangeClient):
             if best_ask is None:
                 logger.error("Cannot close Lighter: no ask")
                 return False
-            price = best_ask * (Decimal("1") + effective_slippage)
+            price = best_ask * (Decimal("1") + slippage_pct)
 
         close_size = abs(position)
         client_order_index = int(time.time() * 1_000_000) % 1_000_000_000
@@ -635,7 +632,7 @@ class LighterClient(BaseExchangeClient):
                 base_amount=int(close_size * self._base_amount_multiplier),
                 price=int(price * self._price_multiplier),
                 is_ask=is_ask,
-                order_type=self._signer.ORDER_TYPE_LIMIT,
+                order_type=self._signer.ORDER_TYPE_MARKET,
                 time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=True,
                 trigger_price=0,

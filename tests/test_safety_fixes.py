@@ -180,6 +180,7 @@ class SafetyFixesTest(unittest.IsolatedAsyncioTestCase):
             short_threshold=Decimal("3"),
             min_spread=Decimal("5"),
         )
+        # diff_long = lighter_bid - grvt_ask = 104 - 101 = 3 < trigger(5)
         analyzer.update(
             lighter_bid=Decimal("104"),
             lighter_ask=Decimal("105"),
@@ -191,9 +192,10 @@ class SafetyFixesTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(direction)
         self.assertEqual(spread, Decimal("0"))
 
+        # diff_long = lighter_bid - grvt_ask = 107 - 101 = 6 > trigger(5)
         analyzer.update(
-            lighter_bid=Decimal("106"),
-            lighter_ask=Decimal("107"),
+            lighter_bid=Decimal("107"),
+            lighter_ask=Decimal("108"),
             grvt_bid=Decimal("100"),
             grvt_ask=Decimal("101"),
         )
