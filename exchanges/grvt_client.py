@@ -435,16 +435,22 @@ class GrvtClient(BaseExchangeClient):
             raise RuntimeError("GRVT not connected")
         try:
             positions = await self._ws.fetch_positions()
+            logger.debug(f"GRVT fetch_positions raw: {positions}")
             if positions:
                 for pos in positions:
-                    symbol = pos.get("symbol", "")
+                    # GRVT SDK returns "instrument", not "symbol"
+                    symbol = pos.get("instrument", pos.get("symbol", ""))
                     if symbol == self._symbol:
-                        size = pos.get("contracts", pos.get("size", 0))
+                        size = pos.get("size", pos.get("contracts", 0))
                         side = pos.get("side", "")
                         amount = Decimal(str(abs(float(size))))
                         if side == "short":
                             amount = -amount
+                        logger.debug(f"GRVT position matched: symbol={symbol} size={size} side={side} → {amount}")
                         return amount
+                # No match found — log what we got for debugging
+                symbols_found = [pos.get("instrument", pos.get("symbol", "?")) for pos in positions]
+                logger.warning(f"GRVT positions exist but no match for {self._symbol}: {symbols_found}")
             return Decimal("0")
         except Exception as e:
             logger.error(f"Failed to get GRVT position: {e}")

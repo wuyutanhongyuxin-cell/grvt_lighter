@@ -93,6 +93,7 @@ class OrderManager:
             # ============ Phase 0: Pre-trade position refresh ============
             logger.info(f"=== PHASE 0: Pre-trade check ({direction}) ===")
             await self._refresh_positions()
+            pre_pos_grvt = self.positions.grvt_position  # snapshot before order
 
             if not self.positions.check_pre_trade():
                 logger.warning("Pre-trade position check failed, skipping")
@@ -158,6 +159,20 @@ class OrderManager:
                     if grvt_fill_data and grvt_fill_data["filled_size"] > 0:
                         logger.info(f"Partial fill detected after cancel: {grvt_fill_data['filled_size']}")
                         break
+
+                    # WS didn't report fill → REST position snapshot fallback
+                    filled_qty = await self._get_filled_qty_from_snapshot(
+                        pre_pos_grvt, grvt_side
+                    )
+                    if filled_qty > 0:
+                        grvt_fill_data = {
+                            "filled_size": filled_qty,
+                            "price": price,  # approximate with order price
+                            "status": "FILLED",
+                        }
+                        logger.info(f"Fill confirmed via position snapshot: {filled_qty}")
+                        break
+
                     # No fill at all — retry with fresh BBO
                     logger.info(f"No fill, retry {retry + 1}/{POST_ONLY_MAX_RETRIES}")
                     continue
@@ -323,6 +338,34 @@ class OrderManager:
             f"Lighter={self.positions.lighter_position} "
             f"net={self.positions.get_net_position()}"
         )
+
+    async def _get_filled_qty_from_snapshot(
+        self, pre_pos: Decimal, side: str
+    ) -> Decimal:
+        """Detect fill via position snapshot diff (01-lighter pattern).
+
+        Compares pre-order position with current API position.
+        Returns confirmed fill quantity, capped at order_quantity.
+        """
+        for attempt in range(3):
+            try:
+                post_pos = await self.grvt_client.get_position()
+                diff = post_pos - pre_pos
+                if side == "buy":
+                    filled = max(diff, Decimal("0"))
+                else:
+                    filled = max(-diff, Decimal("0"))
+                filled = min(filled, self.order_quantity)  # physical cap
+                if filled > 0:
+                    logger.info(
+                        f"Snapshot fill check: pre={pre_pos} post={post_pos} "
+                        f"diff={diff} filled={filled}"
+                    )
+                    return filled
+            except Exception as e:
+                logger.warning(f"Snapshot fill check attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(0.5)
+        return Decimal("0")
 
     @property
     def is_trading_halted(self) -> bool:
