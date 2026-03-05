@@ -113,6 +113,20 @@ class Dashboard:
         self.diff_long: Decimal = Decimal("0")
         self.diff_short: Decimal = Decimal("0")
 
+        # Spread analysis state
+        self.fee_cost: Decimal = Decimal("0")
+        self.natural_spread_long: Decimal = Decimal("0")
+        self.natural_spread_short: Decimal = Decimal("0")
+        self.net_spread_long: Decimal = Decimal("0")
+        self.net_spread_short: Decimal = Decimal("0")
+        self.warmed_up: bool = False
+        self.warmup_progress: int = 0
+        self.warmup_target: int = 0
+        self.persist_long: int = 0
+        self.persist_short: int = 0
+        self.persist_required: int = 1
+        self.execution_mode: str = ""
+
         # Positions
         self.grvt_position: Decimal = Decimal("0")
         self.lighter_position: Decimal = Decimal("0")
@@ -155,14 +169,27 @@ class Dashboard:
 
     # ── Data update methods ──────────────────────────────────────
 
-    def update_bbo(self, grvt_bid, grvt_ask, lighter_bid, lighter_ask,
-                   diff_long, diff_short):
+    def update_bbo(self, grvt_bid, grvt_ask, lighter_bid, lighter_ask):
         self.grvt_bid = grvt_bid
         self.grvt_ask = grvt_ask
         self.lighter_bid = lighter_bid
         self.lighter_ask = lighter_ask
-        self.diff_long = diff_long
-        self.diff_short = diff_short
+
+    def update_spread_stats(self, stats: dict):
+        self.diff_long = stats["diff_long"]
+        self.diff_short = stats["diff_short"]
+        self.fee_cost = stats["fee_cost_long"]
+        self.natural_spread_long = stats["natural_spread_long"]
+        self.natural_spread_short = stats["natural_spread_short"]
+        self.net_spread_long = stats["net_spread_long"]
+        self.net_spread_short = stats["net_spread_short"]
+        self.warmed_up = stats["warmed_up"]
+        self.warmup_progress = stats["warmup_progress"]
+        self.warmup_target = stats["warmup_target"]
+        self.persist_long = stats["persist_long"]
+        self.persist_short = stats["persist_short"]
+        self.persist_required = stats["persist_required"]
+        self.execution_mode = stats.get("execution_mode", "")
 
     def update_positions(self, grvt_pos, lighter_pos):
         self.grvt_position = grvt_pos
@@ -206,7 +233,7 @@ class Dashboard:
             Layout(name="footer", size=3),
         )
         layout["body"].split_column(
-            Layout(name="top", size=12),
+            Layout(name="top", size=14),
             Layout(name="mid", size=12),
             Layout(name="bot"),
         )
@@ -304,22 +331,41 @@ class Dashboard:
         st = self.config.short_threshold
         t = Text()
 
+        # Warmup indicator
+        if not self.warmed_up and self.warmup_target > 0:
+            wp = self.warmup_progress
+            wt = self.warmup_target
+            t.append(f"WARMUP {wp}/{wt}\n", style=f"bold {C_YELLOW}")
+            t.append_text(_bar(float(wp / wt) if wt > 0 else 0, 18, C_YELLOW))
+            t.append("\n\n")
+
         # Long
         t.append("LONG GRVT\n", style=f"bold {C_GREEN}")
-        t.append("Buy GRVT → Sell Lighter\n", style=C_DIM)
-        t.append_text(_fmt_spread(self.diff_long, lt))
-        t.append(f" / ${lt:.0f}\n", style=C_DIM)
-        rl = float(self.diff_long / lt) if lt > 0 else 0
+        t.append(f" raw  $ {self.diff_long:>8.2f}\n", style=C_TEXT)
+        t.append(f" fee  $ {self.fee_cost:>8.2f}\n", style=C_DIM)
+        t.append(f" nat  $ {self.natural_spread_long:>8.2f}\n", style=C_DIM)
+        net_l_style = C_GREEN if self.net_spread_long > lt else C_TEXT
+        persist_l = f"[{self.persist_long}]" if self.persist_required > 1 else ""
+        t.append(f" net  ", style=C_DIM)
+        t.append_text(_fmt_spread(self.net_spread_long, lt))
+        t.append(f" / ${lt:.0f}  {persist_l}\n", style=C_DIM)
+        rl = float(self.net_spread_long / lt) if lt > 0 else 0
+        t.append(" ")
         t.append_text(_bar(rl, 18,
                            C_GREEN if rl > 1 else C_YELLOW if rl > .8 else C_ACCENT))
         t.append("\n\n")
 
         # Short
         t.append("SHORT GRVT\n", style=f"bold {C_RED}")
-        t.append("Sell GRVT → Buy Lighter\n", style=C_DIM)
-        t.append_text(_fmt_spread(self.diff_short, st))
-        t.append(f" / ${st:.0f}\n", style=C_DIM)
-        rs = float(self.diff_short / st) if st > 0 else 0
+        t.append(f" raw  $ {self.diff_short:>8.2f}\n", style=C_TEXT)
+        t.append(f" fee  $ {self.fee_cost:>8.2f}\n", style=C_DIM)
+        t.append(f" nat  $ {self.natural_spread_short:>8.2f}\n", style=C_DIM)
+        persist_s = f"[{self.persist_short}]" if self.persist_required > 1 else ""
+        t.append(f" net  ", style=C_DIM)
+        t.append_text(_fmt_spread(self.net_spread_short, st))
+        t.append(f" / ${st:.0f}  {persist_s}\n", style=C_DIM)
+        rs = float(self.net_spread_short / st) if st > 0 else 0
+        t.append(" ")
         t.append_text(_bar(rs, 18,
                            C_GREEN if rs > 1 else C_YELLOW if rs > .8 else C_ACCENT))
 
@@ -417,6 +463,11 @@ class Dashboard:
         t.append(" Ctrl+C", style=f"bold {C_YELLOW}")
         t.append(" exit  ", style=C_DIM)
         t.append("│", style=C_BORDER)
+        mode_label = self.execution_mode or self.config.execution_mode
+        t.append(f" {mode_label}", style=C_ACCENT)
+        t.append(" │", style=C_BORDER)
+        t.append(f" fee=${self.fee_cost:.2f}", style=C_DIM)
+        t.append(" │", style=C_BORDER)
         t.append(f" L=${self.config.long_threshold}", style=C_GREEN)
         t.append(f" S=${self.config.short_threshold}", style=C_RED)
         t.append(" │", style=C_BORDER)

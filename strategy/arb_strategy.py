@@ -67,7 +67,16 @@ class ArbStrategy:
         # Strategy components
         self.ob_manager = OrderBookManager(self.grvt_client, self.lighter_client)
         self.spread_analyzer = SpreadAnalyzer(
-            config.long_threshold, config.short_threshold, config.min_spread
+            long_threshold=config.long_threshold,
+            short_threshold=config.short_threshold,
+            min_spread=config.min_spread,
+            execution_mode=config.execution_mode,
+            grvt_maker_fee=config.grvt_maker_fee,
+            grvt_taker_fee=config.grvt_taker_fee,
+            lighter_taker_fee=config.lighter_taker_fee,
+            natural_spread_window=config.natural_spread_window,
+            warmup_samples=config.warmup_samples,
+            persistence_count=config.persistence_count,
         )
         self.positions = PositionTracker(config.order_quantity, config.max_position)
         self.data_logger = DataLogger(config.ticker)
@@ -101,6 +110,12 @@ class ArbStrategy:
                      f"long_thresh={self.config.long_threshold} short_thresh={self.config.short_threshold} "
                      f"min_spread={self.config.min_spread} cooldown={self.config.signal_cooldown}s "
                      f"mode={self.config.execution_mode}")
+        logger.info(f"Fees: grvt_maker={self.config.grvt_maker_fee} "
+                     f"grvt_taker={self.config.grvt_taker_fee} "
+                     f"lighter_taker={self.config.lighter_taker_fee}")
+        logger.info(f"Spread: window={self.config.natural_spread_window} "
+                     f"warmup={self.config.warmup_samples} "
+                     f"persistence={self.config.persistence_count}")
 
         await self.grvt_client.connect()
         await self.lighter_client.connect()
@@ -188,15 +203,18 @@ class ArbStrategy:
             self.data_logger.log_bbo(
                 grvt_bid, grvt_ask, lighter_bid, lighter_ask,
                 stats["diff_long"], stats["diff_short"],
+                fee_cost=stats["fee_cost_long"],
+                natural_long=stats["natural_spread_long"],
+                natural_short=stats["natural_spread_short"],
+                net_long=stats["net_spread_long"],
+                net_short=stats["net_spread_short"],
             )
 
         # 4b. Dashboard update (~4Hz = every 12 iterations)
         if self.dashboard and loop_count % 12 == 0:
             stats = self.spread_analyzer.get_stats()
-            self.dashboard.update_bbo(
-                grvt_bid, grvt_ask, lighter_bid, lighter_ask,
-                stats["diff_long"], stats["diff_short"],
-            )
+            self.dashboard.update_bbo(grvt_bid, grvt_ask, lighter_bid, lighter_ask)
+            self.dashboard.update_spread_stats(stats)
             self.dashboard.update_positions(
                 self.positions.grvt_position,
                 self.positions.lighter_position,
@@ -215,11 +233,16 @@ class ArbStrategy:
         # 5. Periodic status log
         if loop_count % STATUS_LOG_INTERVAL == 0 and loop_count > 0:
             stats = self.spread_analyzer.get_stats()
+            warmup_str = "" if stats["warmed_up"] else f" WARMUP={stats['warmup_progress']}/{stats['warmup_target']}"
             logger.info(
-                f"BBO: GRVT={grvt_bid}/{grvt_ask} Lighter={lighter_bid}/{lighter_ask} "
-                f"spread_long=${stats['diff_long']:.2f}(gap=${stats['long_gap']:.2f}) "
-                f"spread_short=${stats['diff_short']:.2f}(gap=${stats['short_gap']:.2f}) "
+                f"raw_L=${stats['diff_long']:.2f} raw_S=${stats['diff_short']:.2f} "
+                f"fee=${stats['fee_cost_long']:.2f} "
+                f"nat_L=${stats['natural_spread_long']:.2f} "
+                f"net_L=${stats['net_spread_long']:.2f}(gap=${stats['long_gap']:.2f}) "
+                f"net_S=${stats['net_spread_short']:.2f}(gap=${stats['short_gap']:.2f}) "
+                f"persist={stats['persist_long']}/{stats['persist_required']} "
                 f"pos: G={self.positions.grvt_position} L={self.positions.lighter_position}"
+                f"{warmup_str}"
             )
 
         # 6. Heartbeat
@@ -290,15 +313,20 @@ class ArbStrategy:
 
             stats = self.spread_analyzer.get_stats()
             if direction == "long_grvt":
-                diff = stats["diff_long"]
+                raw = stats["diff_long"]
+                net = stats["net_spread_long"]
                 trigger = stats["effective_long_trigger"]
+                nat = stats["natural_spread_long"]
             else:
-                diff = stats["diff_short"]
+                raw = stats["diff_short"]
+                net = stats["net_spread_short"]
                 trigger = stats["effective_short_trigger"]
+                nat = stats["natural_spread_short"]
 
             logger.info(
-                f"SIGNAL: direction={direction} diff=${diff:.4f} "
-                f"trigger=${trigger:.4f} min_spread=${stats['min_spread']:.4f}"
+                f"SIGNAL: direction={direction} net=${net:.4f} raw=${raw:.4f} "
+                f"trigger=${trigger:.4f} fee=${stats['fee_cost_long']:.4f} "
+                f"natural=${nat:.4f}"
             )
             self._last_signal_time = now
             if self.config.execution_mode == "market_market":

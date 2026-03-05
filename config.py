@@ -38,6 +38,16 @@ class Config:
     log_level: str = "INFO"
     no_dashboard: bool = False
 
+    # Fee parameters
+    grvt_maker_fee: Decimal = Decimal("-0.000004")   # -0.0004% (rebate)
+    grvt_taker_fee: Decimal = Decimal("0.00042")     # 0.042%
+    lighter_taker_fee: Decimal = Decimal("0")         # 0% (Standard)
+
+    # Spread analysis
+    natural_spread_window: int = 300    # sliding window sample count (~5min @1/s)
+    warmup_samples: int = 30            # warmup sample count (~30s)
+    persistence_count: int = 3          # signal must persist N ticks (N×50ms)
+
     @classmethod
     def from_env_and_args(cls, args: argparse.Namespace) -> "Config":
         env_path = Path(__file__).parent / ".env"
@@ -68,6 +78,14 @@ class Config:
             execution_mode=args.mode,
             log_level=args.log_level,
             no_dashboard=args.no_dashboard,
+            # Fees
+            grvt_maker_fee=Decimal(args.grvt_maker_fee),
+            grvt_taker_fee=Decimal(args.grvt_taker_fee),
+            lighter_taker_fee=Decimal(args.lighter_taker_fee),
+            # Spread analysis
+            natural_spread_window=args.natural_spread_window,
+            warmup_samples=args.warmup_samples,
+            persistence_count=args.persistence_count,
         )
 
         config.validate()
@@ -97,6 +115,12 @@ class Config:
             errors.append("--signal-cooldown must be non-negative")
         if self.fill_timeout <= 0:
             errors.append("--fill-timeout must be positive")
+        if self.natural_spread_window <= 0:
+            errors.append("--natural-spread-window must be positive")
+        if self.warmup_samples < 0:
+            errors.append("--warmup-samples must be non-negative")
+        if self.persistence_count < 1:
+            errors.append("--persistence-count must be >= 1")
         if errors:
             for e in errors:
                 print(f"Config error: {e}", file=sys.stderr)
@@ -121,4 +145,12 @@ def parse_args() -> argparse.Namespace:
                         help="Execution mode (default: maker_taker)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
     parser.add_argument("--no-dashboard", action="store_true", help="Disable rich terminal dashboard, use plain log output")
+    # Fee parameters
+    parser.add_argument("--grvt-maker-fee", default="-0.000004", help="GRVT maker fee rate (default: -0.000004 = -0.0004%% rebate)")
+    parser.add_argument("--grvt-taker-fee", default="0.00042", help="GRVT taker fee rate (default: 0.00042 = 0.042%%)")
+    parser.add_argument("--lighter-taker-fee", default="0", help="Lighter taker fee rate (default: 0)")
+    # Spread analysis
+    parser.add_argument("--natural-spread-window", type=int, default=300, help="Natural spread sliding window size (default: 300)")
+    parser.add_argument("--warmup-samples", type=int, default=30, help="Warmup sample count before trading (default: 30)")
+    parser.add_argument("--persistence-count", type=int, default=3, help="Signal persistence count required (default: 3)")
     return parser.parse_args()

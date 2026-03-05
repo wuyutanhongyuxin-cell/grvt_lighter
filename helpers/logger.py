@@ -53,6 +53,7 @@ class DataLogger:
         self._bbo_writer.writerow([
             "timestamp", "grvt_bid", "grvt_ask", "lighter_bid", "lighter_ask",
             "diff_long", "diff_short",
+            "fee_cost", "natural_long", "natural_short", "net_long", "net_short",
         ])
 
         self._trade_file = open(self._trade_path, "w", newline="", encoding="utf-8")
@@ -63,12 +64,16 @@ class DataLogger:
             "grvt_position", "lighter_position",
         ])
 
-    def log_bbo(self, grvt_bid, grvt_ask, lighter_bid, lighter_ask, diff_long, diff_short):
+    def log_bbo(self, grvt_bid, grvt_ask, lighter_bid, lighter_ask, diff_long, diff_short,
+                 fee_cost=None, natural_long=None, natural_short=None,
+                 net_long=None, net_short=None):
         self._bbo_writer.writerow([
             datetime.now(timezone.utc).isoformat(),
             str(grvt_bid), str(grvt_ask),
             str(lighter_bid), str(lighter_ask),
             str(diff_long), str(diff_short),
+            str(fee_cost or 0), str(natural_long or 0), str(natural_short or 0),
+            str(net_long or 0), str(net_short or 0),
         ])
         self._bbo_file.flush()
 
