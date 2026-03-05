@@ -31,6 +31,7 @@ logger = logging.getLogger("arbitrage.orders")
 # Constants
 POST_ONLY_MAX_RETRIES = 8
 LIGHTER_FILL_TIMEOUT = 2  # seconds (IOC fills instantly, just wait for WS before REST fallback)
+REST_POLL_INTERVAL = 0.5  # seconds — concurrent REST poll interval
 CANCEL_CHECK_GRACE_TIMEOUT = 0.5  # seconds
 CANCEL_RPC_TIMEOUT = 2.0  # seconds
 POST_CANCEL_SETTLE_DELAY = 0.2  # seconds
@@ -137,8 +138,8 @@ class OrderManager:
 
                 # ============ Phase 2: Wait for GRVT fill via WS ============
                 logger.info(f"=== PHASE 2: Waiting for GRVT fill (timeout={self.fill_timeout}s) ===")
-                grvt_fill_data = await self.grvt_client.wait_for_fill(
-                    client_order_id, timeout=self.fill_timeout, keep_pending_on_timeout=True,
+                grvt_fill_data = await self._wait_grvt_fill_concurrent(
+                    client_order_id, pre_pos_grvt, grvt_side, price, self.fill_timeout,
                 )
 
                 if grvt_fill_data is None:
@@ -247,8 +248,8 @@ class OrderManager:
 
             # ============ Phase 4: Wait for Lighter fill via WS ============
             logger.info(f"=== PHASE 4: Waiting for Lighter fill (timeout={LIGHTER_FILL_TIMEOUT}s) ===")
-            lighter_fill_data = await self.lighter_client.wait_for_fill(
-                lighter_client_idx, timeout=LIGHTER_FILL_TIMEOUT,
+            lighter_fill_data = await self._wait_lighter_fill_concurrent(
+                lighter_client_idx, pre_pos_lighter, lighter_side, confirmed_fill_size,
             )
 
             if lighter_fill_data is None:
@@ -395,6 +396,128 @@ class OrderManager:
             f"Lighter={self.positions.lighter_position} "
             f"net={self.positions.get_net_position()}"
         )
+
+    async def _wait_grvt_fill_concurrent(
+        self,
+        client_order_id: str,
+        pre_pos: Decimal,
+        side: str,
+        price: Decimal,
+        timeout: float,
+    ) -> Optional[dict]:
+        """WS + REST concurrent race for GRVT fill detection.
+
+        Loops until deadline: short WS wait (REST_POLL_INTERVAL) → REST position poll.
+        Returns fill_data on success, None on timeout (existing fallback code handles it).
+        """
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            remaining = max(deadline - time.time(), 0.01)
+            ws_wait = min(REST_POLL_INTERVAL, remaining)
+
+            # Short WS wait
+            fill_data = await self.grvt_client.wait_for_fill(
+                client_order_id, timeout=ws_wait, keep_pending_on_timeout=True,
+            )
+            if fill_data is not None:
+                logger.info(f"GRVT fill via WS (concurrent): cid={client_order_id}")
+                return fill_data
+
+            # REST position poll
+            try:
+                post_pos = await self.grvt_client.get_position()
+                diff = post_pos - pre_pos
+                if side == "buy":
+                    filled = max(diff, Decimal("0"))
+                else:
+                    filled = max(-diff, Decimal("0"))
+
+                if filled > 0:
+                    filled = min(filled, self.order_quantity)  # cap at order_quantity
+                    # Fill detected via REST — cancel all remaining orders (partial fill
+                    # may leave the rest of the order alive on the book).
+                    logger.info(
+                        f"GRVT fill via REST poll: pre={pre_pos} post={post_pos} "
+                        f"filled={filled}, canceling remaining orders"
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self.grvt_client.cancel_all_orders(),
+                            timeout=CANCEL_RPC_TIMEOUT,
+                        )
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.warning(f"GRVT cancel_all after REST fill: {e}")
+
+                    self.grvt_client.clear_pending_fill(client_order_id)
+                    return {
+                        "filled_size": filled,
+                        "price": price,
+                        "status": "FILLED",
+                    }
+            except Exception as e:
+                logger.warning(f"GRVT REST poll failed: {e}")
+
+        # Timeout — return None so existing fallback code (cancel → grace → snapshot) runs.
+        return None
+
+    async def _wait_lighter_fill_concurrent(
+        self,
+        client_order_index: int,
+        pre_pos: Decimal,
+        side: str,
+        max_qty: Decimal,
+    ) -> Optional[dict]:
+        """WS + REST concurrent race for Lighter fill detection.
+
+        Loops until LIGHTER_FILL_TIMEOUT: short WS wait → REST position poll.
+        IOC orders are terminal — no cancel needed on fill.
+        Returns fill_data on success, None on timeout (existing fallback code handles it).
+        """
+        deadline = time.time() + LIGHTER_FILL_TIMEOUT
+
+        while time.time() < deadline:
+            remaining = max(deadline - time.time(), 0.01)
+            ws_wait = min(REST_POLL_INTERVAL, remaining)
+
+            # Short WS wait
+            fill_data = await self.lighter_client.wait_for_fill(
+                client_order_index, timeout=ws_wait, keep_pending_on_timeout=True,
+            )
+            if fill_data is not None:
+                logger.info(f"Lighter fill via WS (concurrent): idx={client_order_index}")
+                self.lighter_client._clear_pending_fill(client_order_index)
+                return fill_data
+
+            # REST position poll
+            try:
+                post_pos = await self.lighter_client.get_position()
+                diff = post_pos - pre_pos
+                if side == "buy":
+                    filled = max(diff, Decimal("0"))
+                else:
+                    filled = max(-diff, Decimal("0"))
+
+                if filled > 0:
+                    filled = min(filled, max_qty)  # cap at order_quantity
+                    lighter_bid, lighter_ask = self.lighter_client.get_bbo_unfiltered()
+                    est_price = lighter_bid if side == "sell" else lighter_ask
+                    logger.info(
+                        f"Lighter fill via REST poll: pre={pre_pos} post={post_pos} filled={filled}"
+                    )
+                    # IOC is terminal — no cancel needed
+                    self.lighter_client._clear_pending_fill(client_order_index)
+                    return {
+                        "filled_size": filled,
+                        "avg_price": est_price or Decimal("0"),
+                        "status": "FILLED",
+                    }
+            except Exception as e:
+                logger.warning(f"Lighter REST poll failed: {e}")
+
+        # Timeout — cleanup pending fill and return None for existing fallback
+        self.lighter_client._clear_pending_fill(client_order_index)
+        return None
 
     async def _get_lighter_filled_qty_from_snapshot(
         self, pre_pos: Decimal, side: str, max_qty: Decimal,

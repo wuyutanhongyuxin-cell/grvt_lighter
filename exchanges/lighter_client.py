@@ -595,19 +595,23 @@ class LighterClient(BaseExchangeClient):
                 return client_order_index
             raise
 
-    async def wait_for_fill(self, client_order_index: int, timeout: float) -> Optional[dict]:
+    async def wait_for_fill(
+        self, client_order_index: int, timeout: float, keep_pending_on_timeout: bool = False,
+    ) -> Optional[dict]:
         """Wait for fill confirmation via WS. Returns fill data or None on timeout."""
         event = self._pending_fills.get(client_order_index)
         if not event:
             return None
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
+            self._clear_pending_fill(client_order_index)
             return self._fill_results.pop(client_order_index, None)
         except asyncio.TimeoutError:
             logger.warning(f"Lighter fill timeout for idx={client_order_index} after {timeout}s")
-            return None
-        finally:
+            if keep_pending_on_timeout:
+                return None
             self._clear_pending_fill(client_order_index)
+            return None
 
     async def get_position(self, market_id: str = "") -> Decimal:
         try:
