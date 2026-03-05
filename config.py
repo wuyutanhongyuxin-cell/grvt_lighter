@@ -33,8 +33,8 @@ class Config:
     short_threshold: Decimal = Decimal("10")
     min_spread: Decimal = Decimal("0")
     signal_cooldown: Decimal = Decimal("0")
-    fill_timeout: int = 2  # GRVT maker fill timeout (seconds)
-    post_only_max_retries: int = 2  # max post-only retry attempts (was 8, reduced to cut adverse selection)
+    fill_timeout: int = 1  # GRVT maker fill timeout (seconds) — 1s single-shot to minimize adverse selection
+    post_only_max_retries: int = 1  # single attempt, no retry — adverse selection worsens with each retry
     execution_mode: str = "maker_taker"  # "maker_taker" or "market_market"
     log_level: str = "INFO"
     no_dashboard: bool = False
@@ -144,8 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-threshold", default="10", help="Short signal threshold in USD (default: 10)")
     parser.add_argument("--min-spread", default="0", help="Global minimum spread gate in USD (default: 0)")
     parser.add_argument("--signal-cooldown", default="0", help="Signal cooldown in seconds (default: 0)")
-    parser.add_argument("--fill-timeout", type=int, default=2, help="GRVT maker fill timeout in seconds (default: 2)")
-    parser.add_argument("--post-only-retries", type=int, default=2, help="Max post-only order retry attempts (default: 2)")
+    parser.add_argument("--fill-timeout", type=int, default=1, help="GRVT maker fill timeout in seconds (default: 1)")
+    parser.add_argument("--post-only-retries", type=int, default=1, help="Max post-only order retry attempts (default: 1)")
     parser.add_argument("--mode", default="maker_taker", choices=["maker_taker", "market_market"],
                         help="Execution mode (default: maker_taker)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
