@@ -111,8 +111,7 @@ class ArbStrategy:
                      f"long_thresh={self.config.long_threshold} short_thresh={self.config.short_threshold} "
                      f"min_spread={self.config.min_spread} cooldown={self.config.signal_cooldown}s "
                      f"mode={self.config.execution_mode} "
-                     f"fill_timeout={self.config.fill_timeout}s retries={self.config.post_only_max_retries} "
-                     f"spread_guard=ON")
+                     f"fill_timeout={self.config.fill_timeout}s retries={self.config.post_only_max_retries}")
         logger.info(f"Fees: grvt_maker={self.config.grvt_maker_fee} "
                      f"grvt_taker={self.config.grvt_taker_fee} "
                      f"lighter_taker={self.config.lighter_taker_fee}")

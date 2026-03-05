@@ -67,7 +67,6 @@ class OrderManager:
         self._trading_halted = False
         self._halt_reason = ""
         self.total_trades = 0
-        self.spread_guard_skips = 0  # counter for spread guard skips
 
     async def execute_arb(self, direction: str) -> Optional[dict]:
         """
@@ -224,38 +223,6 @@ class OrderManager:
             confirmed_fill_size = grvt_fill_data["filled_size"]
             grvt_fill_price = grvt_fill_data.get("price", Decimal("0"))
             logger.info(f"GRVT confirmed: {grvt_side} {confirmed_fill_size} @ {grvt_fill_price}")
-
-            # ============ SPREAD GUARD: verify spread still positive before hedging ============
-            lighter_bid_now, lighter_ask_now = self.lighter_client.get_bbo_unfiltered()
-            if lighter_bid_now is not None and lighter_ask_now is not None:
-                if direction == "long_grvt":
-                    # Bought GRVT, will sell Lighter → profit = lighter_bid - grvt_price
-                    expected_spread = lighter_bid_now - grvt_fill_price
-                else:
-                    # Sold GRVT, will buy Lighter → profit = grvt_price - lighter_ask
-                    expected_spread = grvt_fill_price - lighter_ask_now
-
-                if expected_spread < Decimal("0"):
-                    self.spread_guard_skips += 1
-                    logger.warning(
-                        f"SPREAD GUARD: expected_spread=${expected_spread:.2f} < 0, "
-                        f"skipping hedge. GRVT {grvt_side} {confirmed_fill_size}@{grvt_fill_price} "
-                        f"unhedged (total_skips={self.spread_guard_skips})"
-                    )
-                    # Track GRVT position — don't halt, let reverse signal or shutdown close it
-                    self.positions.update_grvt(grvt_side, confirmed_fill_size)
-                    if self.dashboard:
-                        self.dashboard.add_event("GUARD",
-                            f"Spread guard: exp=${expected_spread:.2f}, skip hedge")
-                    await self.telegram.notify_emergency(
-                        f"SPREAD GUARD: {grvt_side} {confirmed_fill_size}@{grvt_fill_price} "
-                        f"unhedged, expected_spread=${expected_spread:.2f}"
-                    )
-                    return None
-                else:
-                    logger.info(f"Spread guard OK: expected_spread=${expected_spread:.2f}")
-            else:
-                logger.warning("Lighter BBO unavailable for spread guard, proceeding with hedge")
 
             # Record Lighter pre-position for Phase 4 snapshot fallback
             pre_pos_lighter = self.positions.lighter_position
