@@ -93,6 +93,7 @@ class ArbStrategy:
             telegram=self.telegram,
             order_quantity=config.order_quantity,
             fill_timeout=config.fill_timeout,
+            max_retries=config.post_only_max_retries,
             dashboard=self.dashboard,
         )
 
@@ -109,7 +110,9 @@ class ArbStrategy:
                      f"max_pos={self.config.max_position} "
                      f"long_thresh={self.config.long_threshold} short_thresh={self.config.short_threshold} "
                      f"min_spread={self.config.min_spread} cooldown={self.config.signal_cooldown}s "
-                     f"mode={self.config.execution_mode}")
+                     f"mode={self.config.execution_mode} "
+                     f"fill_timeout={self.config.fill_timeout}s retries={self.config.post_only_max_retries} "
+                     f"spread_guard=ON")
         logger.info(f"Fees: grvt_maker={self.config.grvt_maker_fee} "
                      f"grvt_taker={self.config.grvt_taker_fee} "
                      f"lighter_taker={self.config.lighter_taker_fee}")

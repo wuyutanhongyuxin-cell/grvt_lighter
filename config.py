@@ -33,7 +33,8 @@ class Config:
     short_threshold: Decimal = Decimal("10")
     min_spread: Decimal = Decimal("0")
     signal_cooldown: Decimal = Decimal("0")
-    fill_timeout: int = 5  # GRVT maker fill timeout (seconds)
+    fill_timeout: int = 2  # GRVT maker fill timeout (seconds)
+    post_only_max_retries: int = 2  # max post-only retry attempts (was 8, reduced to cut adverse selection)
     execution_mode: str = "maker_taker"  # "maker_taker" or "market_market"
     log_level: str = "INFO"
     no_dashboard: bool = False
@@ -75,6 +76,7 @@ class Config:
             min_spread=Decimal(args.min_spread),
             signal_cooldown=Decimal(args.signal_cooldown),
             fill_timeout=args.fill_timeout,
+            post_only_max_retries=args.post_only_retries,
             execution_mode=args.mode,
             log_level=args.log_level,
             no_dashboard=args.no_dashboard,
@@ -115,6 +117,8 @@ class Config:
             errors.append("--signal-cooldown must be non-negative")
         if self.fill_timeout <= 0:
             errors.append("--fill-timeout must be positive")
+        if self.post_only_max_retries < 1:
+            errors.append("--post-only-retries must be >= 1")
         if self.natural_spread_window <= 0:
             errors.append("--natural-spread-window must be positive")
         if self.warmup_samples < 0:
@@ -140,7 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-threshold", default="10", help="Short signal threshold in USD (default: 10)")
     parser.add_argument("--min-spread", default="0", help="Global minimum spread gate in USD (default: 0)")
     parser.add_argument("--signal-cooldown", default="0", help="Signal cooldown in seconds (default: 0)")
-    parser.add_argument("--fill-timeout", type=int, default=5, help="GRVT maker fill timeout in seconds (default: 5)")
+    parser.add_argument("--fill-timeout", type=int, default=2, help="GRVT maker fill timeout in seconds (default: 2)")
+    parser.add_argument("--post-only-retries", type=int, default=2, help="Max post-only order retry attempts (default: 2)")
     parser.add_argument("--mode", default="maker_taker", choices=["maker_taker", "market_market"],
                         help="Execution mode (default: maker_taker)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")

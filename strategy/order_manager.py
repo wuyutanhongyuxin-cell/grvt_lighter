@@ -29,7 +29,7 @@ from strategy.position_tracker import PositionTracker
 logger = logging.getLogger("arbitrage.orders")
 
 # Constants
-POST_ONLY_MAX_RETRIES = 8
+DEFAULT_POST_ONLY_MAX_RETRIES = 2  # default; overridden by config
 LIGHTER_FILL_TIMEOUT = 2  # seconds (IOC fills instantly, just wait for WS before REST fallback)
 REST_POLL_INTERVAL = 0.5  # seconds — concurrent REST poll interval
 CANCEL_CHECK_GRACE_TIMEOUT = 0.5  # seconds
@@ -50,6 +50,7 @@ class OrderManager:
         telegram: TelegramNotifier,
         order_quantity: Decimal,
         fill_timeout: int,
+        max_retries: int = DEFAULT_POST_ONLY_MAX_RETRIES,
         dashboard=None,
     ):
         self.grvt_client = grvt_client
@@ -59,12 +60,14 @@ class OrderManager:
         self.telegram = telegram
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
+        self.max_retries = max_retries
         self.dashboard = dashboard
 
         self._executing = False
         self._trading_halted = False
         self._halt_reason = ""
         self.total_trades = 0
+        self.spread_guard_skips = 0  # counter for spread guard skips
 
     async def execute_arb(self, direction: str) -> Optional[dict]:
         """
@@ -116,7 +119,7 @@ class OrderManager:
             logger.info(f"=== PHASE 1: GRVT post-only {grvt_side} ===")
             grvt_fill_data = None
 
-            for retry in range(POST_ONLY_MAX_RETRIES):
+            for retry in range(self.max_retries):
                 # Get fresh BBO each attempt
                 grvt_bid, grvt_ask = self.grvt_client.get_bbo()
                 if grvt_bid is None or grvt_ask is None:
@@ -198,7 +201,7 @@ class OrderManager:
                         logger.debug(f"Pre-pos refreshed for retry: {pre_pos_grvt}")
                     except Exception:
                         pass  # keep old pre_pos on failure
-                    logger.info(f"No fill, retry {retry + 1}/{POST_ONLY_MAX_RETRIES}")
+                    logger.info(f"No fill, retry {retry + 1}/{self.max_retries}")
                     continue
 
                 if grvt_fill_data["status"] in ("REJECTED", "CANCELLED", "CANCELED"):
@@ -206,7 +209,7 @@ class OrderManager:
                     if filled > 0:
                         logger.info(f"GRVT order {grvt_fill_data['status']} with partial: {filled}")
                         break
-                    logger.info(f"GRVT post-only rejected (not maker), retry {retry + 1}/{POST_ONLY_MAX_RETRIES}")
+                    logger.info(f"GRVT post-only rejected (not maker), retry {retry + 1}/{self.max_retries}")
                     await asyncio.sleep(0.01)
                     continue
 
@@ -221,6 +224,38 @@ class OrderManager:
             confirmed_fill_size = grvt_fill_data["filled_size"]
             grvt_fill_price = grvt_fill_data.get("price", Decimal("0"))
             logger.info(f"GRVT confirmed: {grvt_side} {confirmed_fill_size} @ {grvt_fill_price}")
+
+            # ============ SPREAD GUARD: verify spread still positive before hedging ============
+            lighter_bid_now, lighter_ask_now = self.lighter_client.get_bbo_unfiltered()
+            if lighter_bid_now is not None and lighter_ask_now is not None:
+                if direction == "long_grvt":
+                    # Bought GRVT, will sell Lighter → profit = lighter_bid - grvt_price
+                    expected_spread = lighter_bid_now - grvt_fill_price
+                else:
+                    # Sold GRVT, will buy Lighter → profit = grvt_price - lighter_ask
+                    expected_spread = grvt_fill_price - lighter_ask_now
+
+                if expected_spread < Decimal("0"):
+                    self.spread_guard_skips += 1
+                    logger.warning(
+                        f"SPREAD GUARD: expected_spread=${expected_spread:.2f} < 0, "
+                        f"skipping hedge. GRVT {grvt_side} {confirmed_fill_size}@{grvt_fill_price} "
+                        f"unhedged (total_skips={self.spread_guard_skips})"
+                    )
+                    # Track GRVT position — don't halt, let reverse signal or shutdown close it
+                    self.positions.update_grvt(grvt_side, confirmed_fill_size)
+                    if self.dashboard:
+                        self.dashboard.add_event("GUARD",
+                            f"Spread guard: exp=${expected_spread:.2f}, skip hedge")
+                    await self.telegram.notify_emergency(
+                        f"SPREAD GUARD: {grvt_side} {confirmed_fill_size}@{grvt_fill_price} "
+                        f"unhedged, expected_spread=${expected_spread:.2f}"
+                    )
+                    return None
+                else:
+                    logger.info(f"Spread guard OK: expected_spread=${expected_spread:.2f}")
+            else:
+                logger.warning("Lighter BBO unavailable for spread guard, proceeding with hedge")
 
             # Record Lighter pre-position for Phase 4 snapshot fallback
             pre_pos_lighter = self.positions.lighter_position
@@ -558,7 +593,7 @@ class OrderManager:
         Returns confirmed fill quantity, capped at the physical maximum
         (order_quantity × POST_ONLY_MAX_RETRIES) to guard against API glitches.
         """
-        max_possible = self.order_quantity * POST_ONLY_MAX_RETRIES
+        max_possible = self.order_quantity * self.max_retries
         for attempt in range(3):
             try:
                 post_pos = await self.grvt_client.get_position()
