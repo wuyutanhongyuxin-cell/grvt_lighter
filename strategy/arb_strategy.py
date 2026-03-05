@@ -99,7 +99,8 @@ class ArbStrategy:
         logger.info(f"Config: ticker={self.config.ticker} size={self.config.order_quantity} "
                      f"max_pos={self.config.max_position} "
                      f"long_thresh={self.config.long_threshold} short_thresh={self.config.short_threshold} "
-                     f"min_spread={self.config.min_spread} cooldown={self.config.signal_cooldown}s")
+                     f"min_spread={self.config.min_spread} cooldown={self.config.signal_cooldown}s "
+                     f"mode={self.config.execution_mode}")
 
         await self.grvt_client.connect()
         await self.lighter_client.connect()
@@ -300,7 +301,10 @@ class ArbStrategy:
                 f"trigger=${trigger:.4f} min_spread=${stats['min_spread']:.4f}"
             )
             self._last_signal_time = now
-            await self.order_manager.execute_arb(direction)
+            if self.config.execution_mode == "market_market":
+                await self.order_manager.execute_arb_market_market(direction)
+            else:
+                await self.order_manager.execute_arb(direction)
 
     async def _check_balance(self):
         """Double-confirm balance check (01-lighter pattern)."""

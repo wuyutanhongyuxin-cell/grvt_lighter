@@ -35,6 +35,8 @@ REST_POLL_INTERVAL = 0.5  # seconds — concurrent REST poll interval
 CANCEL_CHECK_GRACE_TIMEOUT = 0.5  # seconds
 CANCEL_RPC_TIMEOUT = 2.0  # seconds
 POST_CANCEL_SETTLE_DELAY = 0.2  # seconds
+GRVT_IOC_SLIPPAGE_PCT = Decimal("0.002")  # 0.2% slippage for GRVT IOC
+MARKET_MARKET_FILL_TIMEOUT = 2  # seconds — IOC should fill instantly
 VALID_DIRECTIONS = {"long_grvt", "short_grvt"}
 
 
@@ -576,6 +578,319 @@ class OrderManager:
                 logger.warning(f"Snapshot fill check attempt {attempt + 1} failed: {e}")
             await asyncio.sleep(0.35)
         return Decimal("0")
+
+    # ============ Market-Market Mode ============
+
+    async def execute_arb_market_market(self, direction: str) -> Optional[dict]:
+        """
+        Execute arbitrage with simultaneous IOC orders on both exchanges.
+        direction: "long_grvt" or "short_grvt"
+
+        Both legs fire concurrently via asyncio.gather, eliminating adverse selection.
+        Returns trade result dict on success, None on failure/skip.
+        """
+        if self._trading_halted:
+            logger.warning(f"Trading halted, skipping signal (reason={self._halt_reason})")
+            return None
+
+        if self._executing:
+            logger.warning("Already executing, skipping")
+            return None
+        self._executing = True
+
+        try:
+            if direction not in VALID_DIRECTIONS:
+                logger.error(f"Invalid direction: {direction}")
+                return None
+
+            # Determine sides
+            if direction == "long_grvt":
+                grvt_side = "buy"
+                lighter_side = "sell"
+            else:
+                grvt_side = "sell"
+                lighter_side = "buy"
+
+            # ============ Phase 0: Pre-trade position refresh ============
+            logger.info(f"=== MM PHASE 0: Pre-trade check ({direction}) ===")
+            await self._refresh_positions()
+
+            if not self.positions.check_pre_trade():
+                logger.warning("Pre-trade position check failed, skipping")
+                return None
+
+            if direction == "long_grvt" and not self.positions.can_long_grvt():
+                logger.info("Max long position reached, skipping")
+                return None
+            if direction == "short_grvt" and not self.positions.can_short_grvt():
+                logger.info("Max short position reached, skipping")
+                return None
+
+            # Snapshot pre-positions from API (already refreshed above)
+            pre_pos_grvt = self.positions.grvt_position
+            pre_pos_lighter = self.positions.lighter_position
+
+            # ============ Phase 1: Calculate IOC prices ============
+            logger.info(f"=== MM PHASE 1: Calculate IOC prices ===")
+            grvt_bid, grvt_ask = self.grvt_client.get_bbo()
+            lighter_bid, lighter_ask = self.lighter_client.get_bbo_unfiltered()
+
+            if any(v is None for v in (grvt_bid, grvt_ask, lighter_bid, lighter_ask)):
+                logger.warning("BBO not available on one or both exchanges, aborting")
+                return None
+
+            # GRVT IOC price with slippage (tick-aligned inside place_ioc_order)
+            if grvt_side == "buy":
+                grvt_price = grvt_ask * (Decimal("1") + GRVT_IOC_SLIPPAGE_PCT)
+            else:
+                grvt_price = grvt_bid * (Decimal("1") - GRVT_IOC_SLIPPAGE_PCT)
+
+            # Lighter IOC price computed inside place_ioc_order (uses its own slippage)
+
+            # ============ Phase 2: Simultaneous IOC orders ============
+            logger.info(
+                f"=== MM PHASE 2: Simultaneous IOC {grvt_side}/{lighter_side} "
+                f"size={self.order_quantity} ==="
+            )
+
+            results = await asyncio.gather(
+                self._execute_grvt_ioc_leg(grvt_side, grvt_price, self.order_quantity, pre_pos_grvt),
+                self._execute_lighter_ioc_leg(lighter_side, self.order_quantity, pre_pos_lighter),
+                return_exceptions=True,
+            )
+
+            # Unpack — gather with return_exceptions=True returns exceptions as values
+            grvt_result = results[0] if not isinstance(results[0], BaseException) else None
+            lighter_result = results[1] if not isinstance(results[1], BaseException) else None
+
+            if isinstance(results[0], BaseException):
+                logger.error(f"GRVT IOC leg exception: {results[0]}")
+            if isinstance(results[1], BaseException):
+                logger.error(f"Lighter IOC leg exception: {results[1]}")
+
+            grvt_filled = grvt_result is not None and grvt_result["filled_size"] > 0
+            lighter_filled = lighter_result is not None and lighter_result["filled_size"] > 0
+
+            # ============ Phase 3: Handle results ============
+            logger.info(f"=== MM PHASE 3: Handle results (GRVT={grvt_filled}, Lighter={lighter_filled}) ===")
+
+            if not grvt_filled and not lighter_filled:
+                # Both sides failed — no exposure, safe to return
+                logger.info("MM: Both sides unfilled, no action needed")
+                return None
+
+            if grvt_filled and not lighter_filled:
+                # GRVT filled but Lighter didn't → unhedged exposure → halt
+                grvt_filled_size = grvt_result["filled_size"]
+                self.positions.update_grvt(grvt_side, grvt_filled_size)
+                self._trading_halted = True
+                self._halt_reason = "MM_SINGLE_LEG_FILL"
+                await self.telegram.notify_emergency(
+                    f"MARKET_MARKET single leg: GRVT {grvt_side} {grvt_filled_size} filled, "
+                    f"Lighter {lighter_side} FAILED"
+                )
+                logger.error(
+                    f"MM SINGLE LEG: GRVT {grvt_side} {grvt_filled_size} filled, "
+                    f"Lighter {lighter_side} failed → HALT"
+                )
+                return None
+
+            if lighter_filled and not grvt_filled:
+                # Lighter filled but GRVT didn't → unhedged exposure → halt
+                lighter_filled_size = lighter_result["filled_size"]
+                self.positions.update_lighter(lighter_side, lighter_filled_size)
+                self._trading_halted = True
+                self._halt_reason = "MM_SINGLE_LEG_FILL"
+                await self.telegram.notify_emergency(
+                    f"MARKET_MARKET single leg: Lighter {lighter_side} {lighter_filled_size} filled, "
+                    f"GRVT {grvt_side} FAILED"
+                )
+                logger.error(
+                    f"MM SINGLE LEG: Lighter {lighter_side} {lighter_filled_size} filled, "
+                    f"GRVT {grvt_side} failed → HALT"
+                )
+                return None
+
+            # ============ Phase 4: Both filled — record trade ============
+            grvt_filled_size = grvt_result["filled_size"]
+            grvt_fill_price = grvt_result["price"]
+            lighter_filled_size = lighter_result["filled_size"]
+            lighter_fill_price = lighter_result["price"]
+
+            logger.info(f"=== MM PHASE 4: Recording trade ===")
+            self.positions.update_grvt(grvt_side, grvt_filled_size)
+            self.positions.update_lighter(lighter_side, lighter_filled_size)
+
+            # Check size mismatch
+            if grvt_filled_size != lighter_filled_size:
+                imbalance = abs(grvt_filled_size - lighter_filled_size)
+                msg = (
+                    f"MM size mismatch: GRVT {grvt_side} {grvt_filled_size}, "
+                    f"Lighter {lighter_side} {lighter_filled_size} — imbalance {imbalance}"
+                )
+                logger.error(msg)
+                self._trading_halted = True
+                self._halt_reason = "MM_SIZE_MISMATCH"
+                await self.telegram.notify_emergency(f"{msg}. Trading halted.")
+
+            # Calculate captured spread
+            if direction == "long_grvt":
+                spread = lighter_fill_price - grvt_fill_price
+            else:
+                spread = grvt_fill_price - lighter_fill_price
+
+            trade_result = {
+                "direction": direction,
+                "grvt_side": grvt_side,
+                "grvt_price": grvt_fill_price,
+                "grvt_size": grvt_filled_size,
+                "lighter_side": lighter_side,
+                "lighter_price": lighter_fill_price,
+                "lighter_size": lighter_filled_size,
+                "spread": spread,
+                "grvt_position": self.positions.grvt_position,
+                "lighter_position": self.positions.lighter_position,
+            }
+
+            self.total_trades += 1
+            self.data_logger.log_trade(**trade_result)
+
+            profit_est = spread * min(grvt_filled_size, lighter_filled_size)
+            logger.info(
+                f"MM TRADE COMPLETE: {direction} spread=${spread:.4f} "
+                f"est_profit=${profit_est:.4f} "
+                f"pos: GRVT={self.positions.grvt_position} Lighter={self.positions.lighter_position}"
+            )
+
+            # Dashboard update
+            if self.dashboard:
+                self.dashboard.add_trade(
+                    direction=direction,
+                    grvt_price=grvt_fill_price,
+                    lighter_price=lighter_fill_price,
+                    size=min(grvt_filled_size, lighter_filled_size),
+                    spread=spread,
+                    profit_est=profit_est,
+                )
+                self.dashboard.add_event("MM_TRADE",
+                    f"{direction} {self.order_quantity} spread=${spread:.4f} pnl=${profit_est:.4f}")
+
+            # Notify
+            await self.telegram.notify_trade(
+                direction=direction,
+                grvt_side=grvt_side, grvt_price=grvt_fill_price, grvt_size=grvt_filled_size,
+                lighter_side=lighter_side, lighter_price=lighter_fill_price, lighter_size=lighter_filled_size,
+                spread_captured=spread,
+                grvt_position=self.positions.grvt_position,
+                lighter_position=self.positions.lighter_position,
+            )
+
+            return trade_result
+
+        except Exception as e:
+            logger.error(f"Unexpected error in execute_arb_market_market: {e}", exc_info=True)
+            return None
+        finally:
+            self._executing = False
+
+    async def _execute_grvt_ioc_leg(
+        self, side: str, price: Decimal, size: Decimal, pre_pos: Decimal,
+    ) -> Optional[dict]:
+        """Execute single GRVT IOC leg + confirm via WS/REST. Never raises."""
+        try:
+            client_order_id = await self.grvt_client.place_ioc_order(
+                side=side, price=price, size=size,
+            )
+
+            # Wait for fill via WS
+            fill_data = await self.grvt_client.wait_for_fill(
+                client_order_id, timeout=MARKET_MARKET_FILL_TIMEOUT,
+            )
+
+            if fill_data and fill_data.get("filled_size", Decimal("0")) > 0:
+                filled = min(fill_data["filled_size"], self.order_quantity)
+                fill_price = fill_data.get("price", Decimal("0"))
+                logger.info(f"GRVT IOC filled via WS: {filled} @ {fill_price}")
+                return {"filled_size": filled, "price": fill_price}
+
+            # WS didn't report fill → REST snapshot fallback
+            logger.info("GRVT IOC WS timeout, checking REST snapshot...")
+            filled_qty = await self._get_filled_qty_from_snapshot(pre_pos, side)
+            if filled_qty > 0:
+                filled_qty = min(filled_qty, self.order_quantity)
+                logger.info(f"GRVT IOC fill confirmed via snapshot: {filled_qty}")
+                return {"filled_size": filled_qty, "price": price}
+
+            logger.info("GRVT IOC: no fill detected")
+            return None
+
+        except Exception as e:
+            logger.error(f"GRVT IOC leg error: {e}", exc_info=True)
+            # Check REST snapshot in case order was accepted despite error
+            try:
+                filled_qty = await self._get_filled_qty_from_snapshot(pre_pos, side)
+                if filled_qty > 0:
+                    filled_qty = min(filled_qty, self.order_quantity)
+                    logger.warning(f"GRVT IOC fill detected via snapshot after error: {filled_qty}")
+                    return {"filled_size": filled_qty, "price": price}
+            except Exception:
+                pass
+            return None
+
+    async def _execute_lighter_ioc_leg(
+        self, side: str, size: Decimal, pre_pos: Decimal,
+    ) -> Optional[dict]:
+        """Execute single Lighter IOC leg + confirm via WS/REST. Never raises."""
+        try:
+            client_order_index = await self.lighter_client.place_ioc_order(
+                side=side, size=size,
+            )
+
+            # Wait for fill via WS
+            fill_data = await self.lighter_client.wait_for_fill(
+                client_order_index, timeout=MARKET_MARKET_FILL_TIMEOUT,
+            )
+
+            if fill_data and fill_data.get("filled_size", Decimal("0")) > 0:
+                filled = min(fill_data["filled_size"], self.order_quantity)
+                fill_price = fill_data.get("avg_price", Decimal("0"))
+                logger.info(f"Lighter IOC filled via WS: {filled} @ {fill_price}")
+                self.lighter_client._clear_pending_fill(client_order_index)
+                return {"filled_size": filled, "price": fill_price}
+
+            # WS didn't report fill → REST snapshot fallback
+            logger.info("Lighter IOC WS timeout, checking REST snapshot...")
+            filled_qty = await self._get_lighter_filled_qty_from_snapshot(
+                pre_pos, side, size,
+            )
+            if filled_qty > 0:
+                filled_qty = min(filled_qty, self.order_quantity)
+                lighter_bid, lighter_ask = self.lighter_client.get_bbo_unfiltered()
+                est_price = lighter_bid if side == "sell" else lighter_ask
+                logger.info(f"Lighter IOC fill confirmed via snapshot: {filled_qty}")
+                self.lighter_client._clear_pending_fill(client_order_index)
+                return {"filled_size": filled_qty, "price": est_price or Decimal("0")}
+
+            logger.info("Lighter IOC: no fill detected")
+            self.lighter_client._clear_pending_fill(client_order_index)
+            return None
+
+        except Exception as e:
+            logger.error(f"Lighter IOC leg error: {e}", exc_info=True)
+            # Check REST snapshot in case order was accepted despite error
+            try:
+                filled_qty = await self._get_lighter_filled_qty_from_snapshot(
+                    pre_pos, side, size,
+                )
+                if filled_qty > 0:
+                    filled_qty = min(filled_qty, self.order_quantity)
+                    lighter_bid, lighter_ask = self.lighter_client.get_bbo_unfiltered()
+                    est_price = lighter_bid if side == "sell" else lighter_ask
+                    logger.warning(f"Lighter IOC fill detected via snapshot after error: {filled_qty}")
+                    return {"filled_size": filled_qty, "price": est_price or Decimal("0")}
+            except Exception:
+                pass
+            return None
 
     @property
     def is_trading_halted(self) -> bool:

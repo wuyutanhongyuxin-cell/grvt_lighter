@@ -34,6 +34,7 @@ class Config:
     min_spread: Decimal = Decimal("0")
     signal_cooldown: Decimal = Decimal("0")
     fill_timeout: int = 5  # GRVT maker fill timeout (seconds)
+    execution_mode: str = "maker_taker"  # "maker_taker" or "market_market"
     log_level: str = "INFO"
     no_dashboard: bool = False
 
@@ -64,6 +65,7 @@ class Config:
             min_spread=Decimal(args.min_spread),
             signal_cooldown=Decimal(args.signal_cooldown),
             fill_timeout=args.fill_timeout,
+            execution_mode=args.mode,
             log_level=args.log_level,
             no_dashboard=args.no_dashboard,
         )
@@ -115,6 +117,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-spread", default="0", help="Global minimum spread gate in USD (default: 0)")
     parser.add_argument("--signal-cooldown", default="0", help="Signal cooldown in seconds (default: 0)")
     parser.add_argument("--fill-timeout", type=int, default=5, help="GRVT maker fill timeout in seconds (default: 5)")
+    parser.add_argument("--mode", default="maker_taker", choices=["maker_taker", "market_market"],
+                        help="Execution mode (default: maker_taker)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
     parser.add_argument("--no-dashboard", action="store_true", help="Disable rich terminal dashboard, use plain log output")
     return parser.parse_args()

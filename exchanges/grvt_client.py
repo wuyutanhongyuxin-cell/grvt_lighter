@@ -488,6 +488,47 @@ class GrvtClient(BaseExchangeClient):
         """Get fill result if already available (for checking after cancel)."""
         return self._fill_results.pop(client_order_id, None)
 
+    async def place_ioc_order(self, side: str, price: Decimal, size: Decimal) -> str:
+        """Place IOC taker order. Returns client_order_id."""
+        if not self._ws:
+            raise RuntimeError("GRVT client not connected")
+
+        # CRITICAL: align price to tick_size — GRVT silently rejects non-aligned prices
+        price = self._align_price_to_tick(price, side)
+
+        client_order_id = str(int(time.time() * 1_000_000))
+
+        # Register fill event BEFORE placing order
+        fill_event = asyncio.Event()
+        self._pending_fills[client_order_id] = fill_event
+
+        try:
+            result = await self._ws.rpc_create_order(
+                symbol=self._symbol,
+                order_type="limit",
+                side=side.lower(),
+                amount=float(size),
+                price=str(price),
+                params={
+                    "client_order_id": client_order_id,
+                    "time_in_force": "IMMEDIATE_OR_CANCEL",
+                    "post_only": False,
+                    "reduce_only": False,
+                },
+            )
+
+            if not result:
+                raise RuntimeError("GRVT rpc_create_order returned empty result")
+
+            logger.info(f"GRVT IOC sent: cid={client_order_id} {side} {size} @ {price}")
+            return client_order_id
+
+        except Exception as e:
+            recovered = await self._recover_submit_after_error(client_order_id, side, size, price, e)
+            if recovered:
+                return client_order_id
+            raise
+
     async def cancel_order(self, client_order_id: str) -> bool:
         """Cancel order by client_order_id."""
         if not self._ws:
