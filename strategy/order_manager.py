@@ -132,6 +132,15 @@ class OrderManager:
                 # === Pre-order spread re-check (二次确认) ===
                 # Verify the spread is still positive before placing order.
                 # Signal was from ~0.5-1s ago; BBO may have inverted since then.
+
+                # Check Lighter OB freshness — stale data = unreliable spread
+                ob_age = self.lighter_client.get_ob_age()
+                if ob_age > 5.0:
+                    logger.info(
+                        f"Lighter OB stale ({ob_age:.1f}s since last update), aborting"
+                    )
+                    return None
+
                 if direction == "long_grvt":
                     live_spread = lighter_bid - grvt_ask
                 else:
@@ -140,7 +149,7 @@ class OrderManager:
                 if live_spread <= Decimal("0"):
                     logger.info(
                         f"Pre-order spread check FAILED: {direction} "
-                        f"live_spread=${live_spread:.2f} "
+                        f"live_spread=${live_spread:.2f} ob_age={ob_age:.1f}s "
                         f"(G_bid={grvt_bid} G_ask={grvt_ask} "
                         f"L_bid={lighter_bid} L_ask={lighter_ask}), aborting"
                     )

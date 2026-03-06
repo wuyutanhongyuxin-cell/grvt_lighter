@@ -236,6 +236,7 @@ class ArbStrategy:
         if loop_count % STATUS_LOG_INTERVAL == 0 and loop_count > 0:
             stats = self.spread_analyzer.get_stats()
             warmup_str = "" if stats["warmed_up"] else f" WARMUP={stats['warmup_progress']}/{stats['warmup_target']}"
+            ob_age = self.lighter_client.get_ob_age()
             logger.info(
                 f"raw_L=${stats['diff_long']:.2f} raw_S=${stats['diff_short']:.2f} "
                 f"fee=${stats['fee_cost_long']:.2f} "
@@ -243,6 +244,7 @@ class ArbStrategy:
                 f"net_L=${stats['net_spread_long']:.2f}(gap=${stats['long_gap']:.2f}) "
                 f"net_S=${stats['net_spread_short']:.2f}(gap=${stats['short_gap']:.2f}) "
                 f"persist={stats['persist_long']}/{stats['persist_required']} "
+                f"ob_age={ob_age:.1f}s "
                 f"pos: G={self.positions.grvt_position} L={self.positions.lighter_position}"
                 f"{warmup_str}"
             )

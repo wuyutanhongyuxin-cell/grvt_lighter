@@ -24,7 +24,7 @@ logger = logging.getLogger("arbitrage.lighter")
 # Constants
 WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 BASE_URL = "https://mainnet.zklighter.elliot.ai"
-MIN_NOTIONAL_FILTER = 40000  # USD — only trade on levels with this notional or more
+MIN_NOTIONAL_FILTER = 1000  # USD — filter dust orders but keep real top-of-book levels
 IOC_SLIPPAGE_PCT = Decimal("0.002")  # 0.2% slippage for IOC execution
 AUTH_TOKEN_LIFETIME = 600  # 10 minutes
 AUTH_TOKEN_REFRESH_AT = 480  # Refresh at 8 minutes
@@ -93,6 +93,7 @@ class LighterClient(BaseExchangeClient):
         self._ob_snapshot_loaded = False
         self._ob_sequence_gap = False
         self._ob_lock = asyncio.Lock()
+        self._last_ob_update_time: float = 0  # track OB freshness separately from WS heartbeat
 
         # Fill tracking — asyncio.Event per client_order_index
         self._pending_fills: Dict[int, asyncio.Event] = {}
@@ -347,6 +348,7 @@ class LighterClient(BaseExchangeClient):
             self._apply_updates("bids", ob.get("bids", []))
             self._apply_updates("asks", ob.get("asks", []))
             self._ob_snapshot_loaded = True
+            self._last_ob_update_time = time.time()
 
             bid_count = len(self._orderbook["bids"])
             ask_count = len(self._orderbook["asks"])
@@ -381,6 +383,7 @@ class LighterClient(BaseExchangeClient):
             self._ob_offset = new_offset
             self._apply_updates("bids", ob.get("bids", []))
             self._apply_updates("asks", ob.get("asks", []))
+            self._last_ob_update_time = time.time()
 
             # Integrity check: best_bid < best_ask
             if self._orderbook["bids"] and self._orderbook["asks"]:
@@ -536,6 +539,12 @@ class LighterClient(BaseExchangeClient):
 
     def is_account_orders_ready(self) -> bool:
         return self._account_orders_ready
+
+    def get_ob_age(self) -> float:
+        """Seconds since last orderbook update (snapshot or delta)."""
+        if self._last_ob_update_time == 0:
+            return float("inf")
+        return time.time() - self._last_ob_update_time
 
     def is_ws_stale(self) -> bool:
         if self._last_ws_msg_time == 0:
