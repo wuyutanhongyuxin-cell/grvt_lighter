@@ -51,6 +51,10 @@ class SpreadAnalyzer:
         self._natural_spread_long: Decimal = ZERO
         self._natural_spread_short: Decimal = ZERO
 
+        # Direction filter: track which exchange is more expensive
+        self._price_diff_history: deque[Decimal] = deque(maxlen=natural_spread_window)
+        self._natural_price_diff: Decimal = ZERO  # median(grvt_mid - lighter_mid), >0 = GRVT贵
+
         # Warmup
         self._warmup_target = warmup_samples
         self._update_count: int = 0
@@ -105,6 +109,9 @@ class SpreadAnalyzer:
         # Step 4: Append to history
         self._raw_long_history.append(self.diff_long)
         self._raw_short_history.append(self.diff_short)
+        grvt_mid = (grvt_bid + grvt_ask) / 2
+        lighter_mid = (lighter_bid + lighter_ask) / 2
+        self._price_diff_history.append(grvt_mid - lighter_mid)
         self._update_count += 1
 
         # Step 5: Recompute natural spread every ~1s (20 ticks @ 50ms)
@@ -152,13 +159,18 @@ class SpreadAnalyzer:
             self._natural_spread_short = Decimal(
                 str(statistics.median(self._raw_short_history))
             )
+        if len(self._price_diff_history) >= 10:
+            self._natural_price_diff = Decimal(
+                str(statistics.median(self._price_diff_history))
+            )
 
     def check_signal(self) -> Tuple[Optional[str], Decimal]:
         """
-        Check for arbitrage signal with three gates:
+        Check for arbitrage signal with four gates:
           1. Warmup complete
           2. net_spread > trigger
           3. Persistence count met
+          4. Direction filter: don't trade against natural price relationship
 
         Returns (direction, net_spread_value) or (None, 0).
         """
@@ -174,12 +186,28 @@ class SpreadAnalyzer:
             self.net_spread_long > long_trigger
             and self._long_persist_counter >= self._persistence_count
         ):
+            # Gate 4: Direction filter — don't buy on the expensive exchange
+            # natural_price_diff > 0 means GRVT is consistently more expensive
+            if self._natural_price_diff > ZERO:
+                logger.debug(
+                    f"Direction filter BLOCKED long_grvt: GRVT is more expensive "
+                    f"(price_diff=${self._natural_price_diff:.2f})"
+                )
+                return None, ZERO
             return "long_grvt", self.net_spread_long
 
         if (
             self.net_spread_short > short_trigger
             and self._short_persist_counter >= self._persistence_count
         ):
+            # Gate 4: Direction filter — don't sell on the cheap exchange
+            # natural_price_diff < 0 means GRVT is consistently cheaper
+            if self._natural_price_diff < ZERO:
+                logger.debug(
+                    f"Direction filter BLOCKED short_grvt: GRVT is cheaper "
+                    f"(price_diff=${self._natural_price_diff:.2f})"
+                )
+                return None, ZERO
             return "short_grvt", self.net_spread_short
 
         return None, ZERO
@@ -214,4 +242,9 @@ class SpreadAnalyzer:
             "persist_short": self._short_persist_counter,
             "persist_required": self._persistence_count,
             "samples_collected": self._update_count,
+            "natural_price_diff": self._natural_price_diff,
+            "direction_allowed": (
+                "both" if self._natural_price_diff == ZERO
+                else ("short_grvt" if self._natural_price_diff > ZERO else "long_grvt")
+            ),
         }

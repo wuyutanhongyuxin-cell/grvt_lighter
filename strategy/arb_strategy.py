@@ -244,6 +244,7 @@ class ArbStrategy:
                 f"net_L=${stats['net_spread_long']:.2f}(gap=${stats['long_gap']:.2f}) "
                 f"net_S=${stats['net_spread_short']:.2f}(gap=${stats['short_gap']:.2f}) "
                 f"persist={stats['persist_long']}/{stats['persist_required']} "
+                f"dir={stats['direction_allowed']}(Δ${stats['natural_price_diff']:.2f}) "
                 f"ob_age={ob_age:.1f}s "
                 f"pos: G={self.positions.grvt_position} L={self.positions.lighter_position}"
                 f"{warmup_str}"

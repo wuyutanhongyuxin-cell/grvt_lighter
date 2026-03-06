@@ -636,48 +636,37 @@ class GrvtClient(BaseExchangeClient):
         close_size = abs(position)
 
         try:
-            client_order_id = str(int(time.time() * 1_000_000))
-            fill_event = asyncio.Event()
-            self._pending_fills[client_order_id] = fill_event
+            logger.info(f"GRVT close order (REST): {side} {close_size} @ {price} (tick-aligned)")
 
-            logger.info(f"GRVT close order: {side} {close_size} @ {price} (tick-aligned)")
-            result = await self._ws.rpc_create_order(
+            # Use REST create_order instead of WS rpc_create_order
+            # WS rpc_create_order is fire-and-forget — orders get silently lost
+            result = await self._ws.create_order(
                 symbol=self._symbol,
                 order_type="limit",
                 side=side,
                 amount=float(close_size),
                 price=str(price),
                 params={
-                    "client_order_id": client_order_id,
                     "time_in_force": "IMMEDIATE_OR_CANCEL",
                     "reduce_only": True,
                 },
             )
-            logger.info(f"GRVT close rpc result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
 
-            # Wait for fill via WS (short timeout — WS fills are unreliable)
-            try:
-                await asyncio.wait_for(fill_event.wait(), timeout=3)
-                fill_data = self._fill_results.pop(client_order_id, None)
-                if fill_data and fill_data.get("filled_size", Decimal("0")) > 0:
-                    logger.info(f"GRVT close filled via WS: {fill_data['filled_size']}")
-                    return True
-            except asyncio.TimeoutError:
-                logger.warning("GRVT close WS fill timeout, checking REST position...")
-            finally:
-                self._pending_fills.pop(client_order_id, None)
+            if result:
+                filled = result.get("filled_size", result.get("filled", "0"))
+                status = result.get("status", "")
+                cid = result.get("metadata", {}).get("client_order_id", "?")
+                logger.info(
+                    f"GRVT close REST response: cid={cid} status={status} filled={filled}"
+                )
 
             # REST fallback: check if position actually closed
-            try:
-                await asyncio.sleep(0.3)  # brief settle
-                remaining = await self.get_position()
-                if abs(remaining) < abs(position) * Decimal("0.10"):
-                    logger.info(f"GRVT close confirmed via REST: remaining={remaining}")
-                    return True
-                logger.warning(f"GRVT close not confirmed: remaining={remaining} (was {position})")
-            except Exception as e:
-                logger.warning(f"GRVT close REST check failed: {e}")
-
+            await asyncio.sleep(0.3)  # brief settle
+            remaining = await self.get_position()
+            if abs(remaining) < abs(position) * Decimal("0.10"):
+                logger.info(f"GRVT close confirmed via REST: remaining={remaining}")
+                return True
+            logger.warning(f"GRVT close not confirmed: remaining={remaining} (was {position})")
             return False
         except Exception as e:
             logger.error(f"GRVT close_position error: {e}")
