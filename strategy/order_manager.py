@@ -119,10 +119,31 @@ class OrderManager:
             grvt_fill_data = None
 
             for retry in range(self.max_retries):
-                # Get fresh BBO each attempt
+                # Get fresh BBO from BOTH exchanges for spread re-check
                 grvt_bid, grvt_ask = self.grvt_client.get_bbo()
+                lighter_bid, lighter_ask = self.lighter_client.get_bbo()
                 if grvt_bid is None or grvt_ask is None:
                     logger.warning("GRVT BBO not available, aborting")
+                    return None
+                if lighter_bid is None or lighter_ask is None:
+                    logger.warning("Lighter BBO not available, aborting")
+                    return None
+
+                # === Pre-order spread re-check (二次确认) ===
+                # Verify the spread is still positive before placing order.
+                # Signal was from ~0.5-1s ago; BBO may have inverted since then.
+                if direction == "long_grvt":
+                    live_spread = lighter_bid - grvt_ask
+                else:
+                    live_spread = grvt_bid - lighter_ask
+
+                if live_spread <= Decimal("0"):
+                    logger.info(
+                        f"Pre-order spread check FAILED: {direction} "
+                        f"live_spread=${live_spread:.2f} "
+                        f"(G_bid={grvt_bid} G_ask={grvt_ask} "
+                        f"L_bid={lighter_bid} L_ask={lighter_ask}), aborting"
+                    )
                     return None
 
                 # Price: buy at ask-tick, sell at bid+tick (ensure maker)
