@@ -34,7 +34,14 @@ async def main() -> int:
     logger.info(f"Fill timeout: {config.fill_timeout}s")
     logger.info("=" * 60)
 
-    strategy = ArbStrategy(config)
+    if config.strategy == "mean_reversion":
+        from strategy.mean_reversion import MeanReversionStrategy
+        strategy = MeanReversionStrategy(config)
+    elif config.strategy == "funding_rate":
+        from strategy.funding_arb import FundingArbStrategy
+        strategy = FundingArbStrategy(config)
+    else:
+        strategy = ArbStrategy(config)
     main_task = asyncio.current_task()
     signal_state = {"count": 0}
 

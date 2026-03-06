@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-  <b>高频跨交易所永续合约套利系统 — Maker/Taker 模型，WebSocket 事件驱动</b>
+  <b>高频跨交易所永续合约套利系统 — 三策略模式，Maker/Taker 模型，WebSocket 事件驱动</b>
 </p>
 
 <p align="center">
@@ -19,6 +19,7 @@
 ## 📋 目录 / Table of Contents
 
 - [概述 / Overview](#概述--overview)
+- [三策略模式 / Strategy Modes](#三策略模式--strategy-modes)
 - [核心特性 / Features](#核心特性--features)
 - [终端 Dashboard / Terminal Dashboard](#终端-dashboard--terminal-dashboard)
 - [系统架构 / Architecture](#系统架构--architecture)
@@ -72,6 +73,60 @@
 | 成交确认 | WS order feed | WS account_orders |
 
 **手续费优势**：GRVT maker rebate + Lighter 零费率 = 几乎零交易成本。
+
+---
+
+## 三策略模式 / Strategy Modes
+
+通过 `--strategy` 参数切换，三种策略共享相同的执行引擎（GRVT maker post-only + Lighter taker IOC）和安全机制：
+
+### 1. 价差套利 `--strategy arb`（默认）
+
+经典跨交易所价差套利。当同一标的在两个交易所出现价差超过阈值时，低买高卖锁定利润。
+
+```bash
+python arbitrage.py --strategy arb --ticker BTC --size 0.001 --max-position 0.01 \
+    --long-threshold 20 --short-threshold 20
+```
+
+### 2. 价差均值回归 `--strategy mean_reversion`
+
+基于价差 z-score 的均值回归策略。计算 `grvt_mid - lighter_mid` 的滚动均值和标准差，当 z-score 偏离均值超过阈值时入场，回归时出场。
+
+```
+状态机: FLAT ─── |z| > entry_z ─── POSITIONED ─── |z| < exit_z ─── FLAT
+                                        │
+                                   |z| > stop_z → 止损出场
+```
+
+```bash
+python arbitrage.py --strategy mean_reversion --ticker BTC --size 0.001 --max-position 0.01 \
+    --mr-entry-z 2.0 --mr-exit-z 0.5 --mr-stop-z 4.0 --mr-window 300 --mr-warmup 60
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--mr-window` | 300 | 滚动窗口样本数（~5min @1样本/s） |
+| `--mr-entry-z` | 2.0 | 入场 z-score 阈值 |
+| `--mr-exit-z` | 0.5 | 出场 z-score 阈值（回归判定） |
+| `--mr-stop-z` | 4.0 | 止损 z-score 阈值 |
+| `--mr-maker-timeout` | 60 | GRVT maker 等待超时（秒） |
+| `--mr-warmup` | 60 | 预热样本数（收集统计数据） |
+
+### 3. Funding Rate 套利 `--strategy funding_rate`
+
+捕获两个交易所之间的 funding rate 差异。建立 delta-neutral 持仓（一侧做多一侧做空），通过 funding rate 差额获利。
+
+```bash
+python arbitrage.py --strategy funding_rate --ticker BTC --size 0.001 --max-position 0.01 \
+    --fr-check-interval 60 --fr-min-diff 0.0001 --fr-hold-min-hours 1
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--fr-check-interval` | 60 | Rate 检查间隔（秒） |
+| `--fr-min-diff` | 0.0001 | 最小 rate 差异阈值（0.01%） |
+| `--fr-hold-min-hours` | 1 | 最短持仓时间（小时），防频繁翻转 |
 
 ---
 
@@ -162,20 +217,22 @@
 ## 系统架构 / Architecture
 
 ```
-arbitrage.py                    ← 入口：信号处理 + 优雅关机
+arbitrage.py                    ← 入口：信号处理 + 策略分发 + 优雅关机
     │
-    ├── config.py               ← 配置：CLI args + .env
+    ├── config.py               ← 配置：CLI args + .env + 三策略参数
     │
     ├── strategy/
-    │   ├── arb_strategy.py     ← 主循环：50ms 健康检查 + 信号检测 + 风控
-    │   ├── order_manager.py    ← 交易核心：5 阶段生命周期管理
-    │   ├── spread_analyzer.py  ← 价差计算 + 信号触发
-    │   ├── position_tracker.py ← 仓位追踪 + API 对账
-    │   └── order_book_manager.py ← 双交易所 BBO 聚合
+    │   ├── arb_strategy.py     ← 价差套利：50ms 主循环 + 信号检测
+    │   ├── mean_reversion.py   ← 均值回归：z-score 信号 + 状态机
+    │   ├── funding_arb.py      ← Funding Rate：rate 差异 + delta-neutral
+    │   ├── order_manager.py    ← 交易核心：5 阶段生命周期管理（arb 专用）
+    │   ├── spread_analyzer.py  ← 价差计算 + 信号触发（arb 专用）
+    │   ├── position_tracker.py ← 仓位追踪 + API 对账（共用）
+    │   └── order_book_manager.py ← 双交易所 BBO 聚合（共用）
     │
     ├── exchanges/
     │   ├── base.py             ← 交易所抽象基类
-    │   ├── grvt_client.py      ← GRVT Maker 端（grvt-pysdk）
+    │   ├── grvt_client.py      ← GRVT Maker 端（grvt-pysdk）+ funding rate
     │   └── lighter_client.py   ← Lighter Taker 端（自定义 WS + lighter-sdk）
     │
     └── helpers/
@@ -347,16 +404,45 @@ nohup python arbitrage.py --no-dashboard --ticker BTC --size 0.001 --max-positio
 
 ## 命令行参数 / CLI Reference
 
+**通用参数**
+
 | 参数 | 必需 | 默认值 | 说明 |
 |------|:----:|--------|------|
+| `--strategy` | | `arb` | 策略模式：`arb` / `mean_reversion` / `funding_rate` |
 | `--ticker` | | `BTC` | 交易标的（`BTC`, `ETH`） |
 | `--size` | ✅ | — | 每笔交易数量（基础资产单位） |
 | `--max-position` | ✅ | — | 单侧最大持仓量 |
-| `--long-threshold` | | `10` | Long 信号触发阈值（USD 绝对值） |
-| `--short-threshold` | | `10` | Short 信号触发阈值（USD 绝对值） |
-| `--fill-timeout` | | `5` | GRVT Maker 成交等待超时（秒） |
+| `--fill-timeout` | | `1` | GRVT Maker 成交等待超时（秒，arb 模式） |
 | `--log-level` | | `INFO` | 日志级别：`DEBUG`/`INFO`/`WARNING`/`ERROR` |
 | `--no-dashboard` | | `false` | 禁用 Rich Dashboard，使用纯文本日志输出 |
+
+**Arb 策略参数**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--long-threshold` | `10` | Long 信号触发阈值（USD） |
+| `--short-threshold` | `10` | Short 信号触发阈值（USD） |
+| `--min-spread` | `0` | 全局最小价差门槛（USD） |
+| `--signal-cooldown` | `0` | 信号冷却时间（秒） |
+
+**Mean Reversion 参数**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--mr-window` | `300` | 滚动窗口样本数（~5min） |
+| `--mr-entry-z` | `2.0` | 入场 z-score 阈值 |
+| `--mr-exit-z` | `0.5` | 出场 z-score 阈值 |
+| `--mr-stop-z` | `4.0` | 止损 z-score 阈值 |
+| `--mr-maker-timeout` | `60` | GRVT maker 等待超时（秒） |
+| `--mr-warmup` | `60` | 预热样本数 |
+
+**Funding Rate 参数**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--fr-check-interval` | `60` | Rate 检查间隔（秒） |
+| `--fr-min-diff` | `0.0001` | 最小 rate 差异阈值（0.01%） |
+| `--fr-hold-min-hours` | `1` | 最短持仓时间（小时） |
 
 ### 参数选择建议
 
@@ -469,6 +555,18 @@ timestamp,grvt_bid,grvt_ask,lighter_bid,lighter_ask,diff_long,diff_short
 timestamp,direction,grvt_side,grvt_price,grvt_size,lighter_side,lighter_price,lighter_size,spread,grvt_position,lighter_position
 ```
 
+### 策略专用数据（MR / FR 模式）
+
+Mean Reversion 模式额外生成 `data/mr_{ticker}_{timestamp}.csv`：
+```csv
+timestamp,spread,mean,std,z_score,state,direction,grvt_pos,lighter_pos
+```
+
+Funding Rate 模式额外生成 `data/fr_{ticker}_{timestamp}.csv`：
+```csv
+timestamp,grvt_rate,lighter_rate,rate_diff,state,direction,grvt_pos,lighter_pos
+```
+
 日志文件输出到 `logs/` 目录。
 
 ---
@@ -499,8 +597,8 @@ timestamp,direction,grvt_side,grvt_price,grvt_size,lighter_side,lighter_price,li
 
 ```
 grvt_lighter/
-├── arbitrage.py              # 入口 — 信号处理 + 优雅关机
-├── config.py                 # 配置 — CLI + .env 融合
+├── arbitrage.py              # 入口 — 信号处理 + 策略分发 + 优雅关机
+├── config.py                 # 配置 — CLI + .env + 三策略参数
 ├── requirements.txt          # Python 依赖
 ├── .env.example              # 环境变量模板
 ├── .gitignore
@@ -508,16 +606,18 @@ grvt_lighter/
 ├── exchanges/
 │   ├── __init__.py
 │   ├── base.py               # 抽象基类 — connect/disconnect/get_position/...
-│   ├── grvt_client.py        # GRVT Maker 端 — grvt-pysdk, post-only, WS fill
+│   ├── grvt_client.py        # GRVT Maker 端 — grvt-pysdk, post-only, WS fill, funding rate
 │   └── lighter_client.py     # Lighter Taker 端 — 自定义 WS, FOK, fill event
 │
 ├── strategy/
 │   ├── __init__.py
-│   ├── arb_strategy.py       # 主循环 — 50ms, 健康检查/BBO/价差/风控/交易
-│   ├── order_manager.py      # 交易引擎 — 5 阶段生命周期
-│   ├── spread_analyzer.py    # 价差计算 — bid-bid / ask-ask 比较
-│   ├── position_tracker.py   # 仓位追踪 — 增量 + API 对账
-│   └── order_book_manager.py # BBO 聚合 — 双交易所 facade
+│   ├── arb_strategy.py       # 价差套利 — 50ms 主循环, 健康检查/BBO/价差/风控
+│   ├── mean_reversion.py     # 均值回归 — z-score 信号, 状态机, GRVT maker+Lighter taker
+│   ├── funding_arb.py        # Funding Rate — rate 差异信号, delta-neutral 持仓
+│   ├── order_manager.py      # 交易引擎 — 5 阶段生命周期（arb 专用）
+│   ├── spread_analyzer.py    # 价差计算 — bid-bid / ask-ask 比较（arb 专用）
+│   ├── position_tracker.py   # 仓位追踪 — 增量 + API 对账（共用）
+│   └── order_book_manager.py # BBO 聚合 — 双交易所 facade（共用）
 │
 ├── helpers/
 │   ├── __init__.py
@@ -525,7 +625,7 @@ grvt_lighter/
 │   ├── logger.py             # 日志（双模式：dashboard/plain）+ CSV DataLogger
 │   └── telegram.py           # Telegram 异步通知
 │
-├── data/                     # (运行时生成) BBO + 交易 CSV
+├── data/                     # (运行时生成) BBO + 交易 + MR/FR CSV
 └── logs/                     # (运行时生成) 详细日志文件
 ```
 

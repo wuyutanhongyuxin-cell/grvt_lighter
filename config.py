@@ -49,6 +49,22 @@ class Config:
     warmup_samples: int = 30            # warmup sample count (~30s)
     persistence_count: int = 3          # signal must persist N ticks (N×50ms)
 
+    # Strategy selection
+    strategy: str = "arb"
+
+    # Mean Reversion
+    mr_window: int = 300              # rolling window sample count (~5min @1sample/s)
+    mr_entry_z: Decimal = Decimal("2.0")
+    mr_exit_z: Decimal = Decimal("0.5")
+    mr_stop_z: Decimal = Decimal("4.0")
+    mr_maker_timeout: int = 60       # GRVT maker fill wait timeout (seconds)
+    mr_warmup: int = 60              # warmup sample count
+
+    # Funding Rate
+    fr_check_interval: int = 60      # rate check interval (seconds)
+    fr_min_diff: Decimal = Decimal("0.0001")  # minimum rate diff (0.01%)
+    fr_hold_min_hours: Decimal = Decimal("1") # minimum holding period (hours)
+
     @classmethod
     def from_env_and_args(cls, args: argparse.Namespace) -> "Config":
         env_path = Path(__file__).parent / ".env"
@@ -88,6 +104,19 @@ class Config:
             natural_spread_window=args.natural_spread_window,
             warmup_samples=args.warmup_samples,
             persistence_count=args.persistence_count,
+            # Strategy selection
+            strategy=args.strategy,
+            # Mean Reversion
+            mr_window=args.mr_window,
+            mr_entry_z=Decimal(args.mr_entry_z),
+            mr_exit_z=Decimal(args.mr_exit_z),
+            mr_stop_z=Decimal(args.mr_stop_z),
+            mr_maker_timeout=args.mr_maker_timeout,
+            mr_warmup=args.mr_warmup,
+            # Funding Rate
+            fr_check_interval=args.fr_check_interval,
+            fr_min_diff=Decimal(args.fr_min_diff),
+            fr_hold_min_hours=Decimal(args.fr_hold_min_hours),
         )
 
         config.validate()
@@ -125,6 +154,14 @@ class Config:
             errors.append("--warmup-samples must be non-negative")
         if self.persistence_count < 1:
             errors.append("--persistence-count must be >= 1")
+        # Mean Reversion validation
+        if self.strategy == "mean_reversion":
+            if self.mr_entry_z <= self.mr_exit_z:
+                errors.append("--mr-entry-z must be > --mr-exit-z")
+            if self.mr_exit_z <= 0:
+                errors.append("--mr-exit-z must be > 0")
+            if self.mr_stop_z <= self.mr_entry_z:
+                errors.append("--mr-stop-z must be > --mr-entry-z")
         if errors:
             for e in errors:
                 print(f"Config error: {e}", file=sys.stderr)
@@ -158,4 +195,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--natural-spread-window", type=int, default=300, help="Natural spread sliding window size (default: 300)")
     parser.add_argument("--warmup-samples", type=int, default=30, help="Warmup sample count before trading (default: 30)")
     parser.add_argument("--persistence-count", type=int, default=3, help="Signal persistence count required (default: 3)")
+    # Strategy selection
+    parser.add_argument("--strategy", default="arb", choices=["arb", "mean_reversion", "funding_rate"],
+                        help="Strategy mode (default: arb)")
+    # Mean Reversion
+    parser.add_argument("--mr-window", type=int, default=300, help="MR rolling window sample count (default: 300)")
+    parser.add_argument("--mr-entry-z", default="2.0", help="MR entry z-score threshold (default: 2.0)")
+    parser.add_argument("--mr-exit-z", default="0.5", help="MR exit z-score threshold (default: 0.5)")
+    parser.add_argument("--mr-stop-z", default="4.0", help="MR stop-loss z-score threshold (default: 4.0)")
+    parser.add_argument("--mr-maker-timeout", type=int, default=60, help="MR GRVT maker fill timeout in seconds (default: 60)")
+    parser.add_argument("--mr-warmup", type=int, default=60, help="MR warmup sample count (default: 60)")
+    # Funding Rate
+    parser.add_argument("--fr-check-interval", type=int, default=60, help="FR rate check interval in seconds (default: 60)")
+    parser.add_argument("--fr-min-diff", default="0.0001", help="FR minimum rate diff threshold (default: 0.0001)")
+    parser.add_argument("--fr-hold-min-hours", default="1", help="FR minimum holding period in hours (default: 1)")
     return parser.parse_args()

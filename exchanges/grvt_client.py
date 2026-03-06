@@ -672,6 +672,20 @@ class GrvtClient(BaseExchangeClient):
             logger.error(f"GRVT close_position error: {e}")
             return False
 
+    async def get_funding_rate(self) -> Decimal:
+        """Get current funding rate via CCXT fetch_funding_rate."""
+        if not self._ws:
+            raise RuntimeError("GRVT not connected")
+        try:
+            result = await self._ws.fetch_funding_rate(self._symbol)
+            rate = result.get("fundingRate", 0)
+            if rate is None:
+                rate = 0
+            return Decimal(str(rate))
+        except Exception as e:
+            logger.error(f"GRVT get_funding_rate failed: {e}")
+            raise
+
     @property
     def tick_size(self) -> Decimal:
         return self._tick_size
