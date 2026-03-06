@@ -722,9 +722,9 @@ class LighterClient(BaseExchangeClient):
             )
             logger.info(f"Lighter close order sent: {side} {close_size} @ {price}")
 
-            # Wait for fill confirmation via WS
+            # Wait for fill confirmation via WS (short timeout — WS fills are unreliable)
             try:
-                await asyncio.wait_for(fill_event.wait(), timeout=15)
+                await asyncio.wait_for(fill_event.wait(), timeout=3)
                 result = self._fill_results.pop(client_order_index, None)
                 if result and result.get("filled_size", Decimal("0")) > 0:
                     logger.info(f"Lighter close filled via WS: {result['filled_size']}")
@@ -734,7 +734,7 @@ class LighterClient(BaseExchangeClient):
 
             # REST fallback: check if position actually closed
             try:
-                await asyncio.sleep(1)  # let order settle
+                await asyncio.sleep(0.3)  # brief settle
                 remaining = await self.get_position()
                 if abs(remaining) < abs(position) * Decimal("0.5"):
                     logger.info(f"Lighter close confirmed via REST: remaining={remaining}")

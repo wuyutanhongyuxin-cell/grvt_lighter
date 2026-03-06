@@ -39,7 +39,7 @@ BALANCE_CHECK_INTERVAL = 10  # seconds
 HEARTBEAT_INTERVAL = 300  # seconds (5 minutes)
 MIN_BALANCE = Decimal("10")  # USDC
 STATUS_LOG_INTERVAL = 30  # loop iterations (~1.5s)
-SHUTDOWN_SLIPPAGE_LEVELS = [Decimal("0.02"), Decimal("0.05"), Decimal("0.10")]
+SHUTDOWN_SLIPPAGE_LEVELS = [Decimal("0.05"), Decimal("0.10"), Decimal("0.20")]
 
 
 class ArbStrategy:
@@ -369,19 +369,19 @@ class ArbStrategy:
         logger.info("=== SHUTDOWN STARTED ===")
         self._stop_flag = True
 
-        # Step 1: Cancel all pending orders
+        # Step 1: Cancel all pending orders (PARALLEL)
         logger.info("Step 1: Canceling all orders...")
-        try:
-            await asyncio.wait_for(self.grvt_client.cancel_all_orders(), timeout=15)
-        except Exception as e:
-            logger.warning(f"GRVT cancel all failed: {e}")
+        cancel_tasks = [
+            asyncio.wait_for(self.grvt_client.cancel_all_orders(), timeout=5),
+            asyncio.wait_for(self.lighter_client.cancel_all_orders(), timeout=5),
+        ]
+        results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                label = "GRVT" if i == 0 else "Lighter"
+                logger.warning(f"{label} cancel all failed: {r}")
 
-        try:
-            await asyncio.wait_for(self.lighter_client.cancel_all_orders(), timeout=15)
-        except Exception as e:
-            logger.warning(f"Lighter cancel all failed: {e}")
-
-        await asyncio.sleep(1)  # Let cancellations settle
+        await asyncio.sleep(0.3)  # Brief settle
 
         # Step 2: Close positions with escalating slippage
         logger.info("Step 2: Closing positions...")
@@ -416,15 +416,18 @@ class ArbStrategy:
         logger.info("=== SHUTDOWN COMPLETE ===")
 
     async def _close_all_positions(self):
-        """Close positions on both exchanges with retry + escalating slippage."""
+        """Close positions on both exchanges with retry + escalating slippage.
+        Optimized: parallel queries, parallel closes, minimal waits."""
         min_size = self.config.order_quantity * Decimal("0.01")  # 1% of order qty
 
         for attempt, slippage in enumerate(SHUTDOWN_SLIPPAGE_LEVELS):
             logger.info(f"Close attempt {attempt + 1}/{len(SHUTDOWN_SLIPPAGE_LEVELS)}, slippage={slippage * 100}%")
 
-            # Fetch real positions from API
-            grvt_pos = await self._safe_get_position(self.grvt_client)
-            lighter_pos = await self._safe_get_position(self.lighter_client)
+            # Fetch real positions from API (PARALLEL)
+            grvt_pos, lighter_pos = await asyncio.gather(
+                self._safe_get_position(self.grvt_client),
+                self._safe_get_position(self.lighter_client),
+            )
 
             # Cross-check: take the larger absolute value (宁多平不漏平)
             grvt_close = self._pick_position(grvt_pos, self.positions.grvt_position, "GRVT")
@@ -434,31 +437,30 @@ class ArbStrategy:
                 logger.info("Both positions cleared!")
                 return
 
-            # Close GRVT
+            # Close BOTH exchanges in PARALLEL
+            close_tasks = []
             if abs(grvt_close) >= min_size:
-                try:
-                    success = await asyncio.wait_for(
-                        self.grvt_client.close_position("", grvt_close, slippage),
-                        timeout=20,
-                    )
-                    if success:
-                        logger.info(f"GRVT position closed: {grvt_close}")
-                except Exception as e:
-                    logger.error(f"GRVT close failed: {e}")
-
-            # Close Lighter
+                close_tasks.append(("GRVT", grvt_close, asyncio.wait_for(
+                    self.grvt_client.close_position("", grvt_close, slippage),
+                    timeout=10,
+                )))
             if abs(lighter_close) >= min_size:
-                try:
-                    success = await asyncio.wait_for(
-                        self.lighter_client.close_position("", lighter_close, slippage),
-                        timeout=20,
-                    )
-                    if success:
-                        logger.info(f"Lighter position closed: {lighter_close}")
-                except Exception as e:
-                    logger.error(f"Lighter close failed: {e}")
+                close_tasks.append(("Lighter", lighter_close, asyncio.wait_for(
+                    self.lighter_client.close_position("", lighter_close, slippage),
+                    timeout=10,
+                )))
 
-            await asyncio.sleep(5)  # Wait between attempts
+            if close_tasks:
+                results = await asyncio.gather(
+                    *[t[2] for t in close_tasks], return_exceptions=True
+                )
+                for (label, size, _), result in zip(close_tasks, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"{label} close failed: {result}")
+                    elif result:
+                        logger.info(f"{label} position closed: {size}")
+
+            await asyncio.sleep(1)  # Brief settle between attempts
 
         # Final check — use conservative fallback (never mask real positions with 0)
         final_grvt = await self._final_position_check(
