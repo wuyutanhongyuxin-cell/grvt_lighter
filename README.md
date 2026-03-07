@@ -29,6 +29,7 @@
 - [配置说明 / Configuration](#配置说明--configuration)
 - [风险管理 / Risk Management](#风险管理--risk-management)
 - [数据输出 / Data Output](#数据输出--data-output)
+- [推荐参数 / Recommended Parameters](#推荐参数--recommended-parameters)
 - [Telegram 通知 / Notifications](#telegram-通知--notifications)
 - [项目结构 / Project Structure](#项目结构--project-structure)
 - [核心设计决策 / Design Decisions](#核心设计决策--design-decisions)
@@ -142,7 +143,7 @@ python arbitrage.py --strategy funding_rate --ticker BTC --size 0.001 --max-posi
 - **仓位双源追踪** — 本地增量 + API 周期对账（60s）
 - **仓位偏差紧急停机** — 净暴露超过 `order_qty × 3` 立即停止
 - **余额双重确认** — 防止 API 502 错误导致假性低余额触发停机
-- **退出强制平仓** — 3 轮递增滑点（2% → 5% → 10%）保证平仓
+- **退出强制平仓** — 3 轮重试 + 2% 滑点封顶（GRVT 价格保护带限制）保证平仓
 - **Ctrl+C 不可中断关机** — shutdown 期间屏蔽信号，确保完整退出
 - **Lighter fill 超时安全默认** — 未确认成交 = 视为零成交，宁漏不错
 
@@ -394,7 +395,7 @@ nohup python arbitrage.py --no-dashboard --ticker BTC --size 0.001 --max-positio
 
 按 `Ctrl+C` 触发优雅关机：
 1. 取消所有挂单
-2. 三轮递增滑点平仓（2% → 5% → 10%）
+2. 三轮重试平仓（GRVT 2% 滑点封顶 + Lighter 递增滑点）
 3. 恢复终端（Dashboard 模式下自动退出全屏）
 4. 断开 WebSocket
 5. 发送 Telegram 停止通知
@@ -404,7 +405,7 @@ nohup python arbitrage.py --no-dashboard --ticker BTC --size 0.001 --max-positio
 
 ## 命令行参数 / CLI Reference
 
-**通用参数**
+### 通用参数（三种策略共用）
 
 | 参数 | 必需 | 默认值 | 说明 |
 |------|:----:|--------|------|
@@ -412,59 +413,52 @@ nohup python arbitrage.py --no-dashboard --ticker BTC --size 0.001 --max-positio
 | `--ticker` | | `BTC` | 交易标的（`BTC`, `ETH`） |
 | `--size` | ✅ | — | 每笔交易数量（基础资产单位） |
 | `--max-position` | ✅ | — | 单侧最大持仓量 |
-| `--fill-timeout` | | `1` | GRVT Maker 成交等待超时（秒，arb 模式） |
-| `--log-level` | | `INFO` | 日志级别：`DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `--mode` | | `maker_taker` | 执行模式：`maker_taker` / `market_market` |
+| `--fill-timeout` | | `1` | GRVT Maker 成交等待超时（秒） |
+| `--post-only-retries` | | `1` | Post-only 订单重试次数 |
+| `--signal-cooldown` | | `0` | 信号冷却时间（秒），防止连续追信号 |
+| `--log-level` | | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `--no-dashboard` | | `false` | 禁用 Rich Dashboard，使用纯文本日志输出 |
 
-**Arb 策略参数**
+### 费率参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--long-threshold` | `10` | Long 信号触发阈值（USD） |
-| `--short-threshold` | `10` | Short 信号触发阈值（USD） |
-| `--min-spread` | `0` | 全局最小价差门槛（USD） |
-| `--signal-cooldown` | `0` | 信号冷却时间（秒） |
+| `--grvt-maker-fee` | `-0.000004` | GRVT maker 费率（负值 = rebate 返佣，-0.0004%） |
+| `--grvt-taker-fee` | `0.00042` | GRVT taker 费率（0.042%） |
+| `--lighter-taker-fee` | `0` | Lighter taker 费率（0%） |
 
-**Mean Reversion 参数**
+### Arb 策略参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--mr-window` | `300` | 滚动窗口样本数（~5min） |
-| `--mr-entry-z` | `2.0` | 入场 z-score 阈值 |
-| `--mr-exit-z` | `0.5` | 出场 z-score 阈值 |
-| `--mr-stop-z` | `4.0` | 止损 z-score 阈值 |
+| `--long-threshold` | `10` | Long 信号触发阈值（USD 绝对差值） |
+| `--short-threshold` | `10` | Short 信号触发阈值（USD 绝对差值） |
+| `--min-spread` | `0` | 全局最小价差门槛（USD），低于此值直接忽略 |
+| `--natural-spread-window` | `300` | 自然价差滑动窗口样本数（~5min @1样本/s） |
+| `--warmup-samples` | `30` | 预热样本数，收集完才开始交易（~30s） |
+| `--persistence-count` | `3` | 信号持续确认次数（N × 50ms），过滤闪现假信号 |
+
+### Mean Reversion 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--mr-window` | `300` | 滚动窗口样本数（~5min @1样本/s） |
+| `--mr-entry-z` | `2.0` | 入场 z-score 阈值（偏离均值多远入场） |
+| `--mr-exit-z` | `0.5` | 出场 z-score 阈值（回归到多近出场） |
+| `--mr-stop-z` | `4.0` | 止损 z-score 阈值（价差继续发散时止损） |
 | `--mr-maker-timeout` | `60` | GRVT maker 等待超时（秒） |
-| `--mr-warmup` | `60` | 预热样本数 |
+| `--mr-warmup` | `60` | 预热样本数（均值/标准差收敛后再交易） |
 
-**Funding Rate 参数**
+> **约束**：`mr-stop-z > mr-entry-z > mr-exit-z > 0`
+
+### Funding Rate 参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--fr-check-interval` | `60` | Rate 检查间隔（秒） |
-| `--fr-min-diff` | `0.0001` | 最小 rate 差异阈值（0.01%） |
-| `--fr-hold-min-hours` | `1` | 最短持仓时间（小时） |
-
-### 参数选择建议
-
-**BTC**：
-```bash
-# 保守配置
---size 0.001 --max-position 0.005 --long-threshold 15 --short-threshold 15
-
-# 激进配置
---size 0.005 --max-position 0.05 --long-threshold 5 --short-threshold 5
-```
-
-**ETH**：
-```bash
-# 保守配置
---size 0.01 --max-position 0.05 --long-threshold 8 --short-threshold 8
-
-# 激进配置
---size 0.05 --max-position 0.5 --long-threshold 3 --short-threshold 3
-```
-
-> **阈值说明**：阈值是 USD 绝对差值。BTC 价格约 $95,000 时，$10 阈值 ≈ 1 bps。阈值越低交易越频繁但价差越小。
+| `--fr-check-interval` | `60` | Rate 检查间隔（秒），funding rate 变化慢 |
+| `--fr-min-diff` | `0.0001` | 最小 rate 差异阈值（0.01%），低于不建仓 |
+| `--fr-hold-min-hours` | `1` | 最短持仓时间（小时），防止频繁翻转 |
 
 ---
 
@@ -511,7 +505,7 @@ Layer 3: Runtime Monitoring
 Layer 4: Graceful Shutdown
 ├── Ctrl+C 信号 → 屏蔽后续中断
 ├── 取消所有挂单
-├── 3 轮递增滑点平仓（2% → 5% → 10%）
+├── 3 轮重试平仓（GRVT 2% 封顶，Lighter 递增滑点）
 ├── 平仓使用 max(API仓位, 本地仓位) — 宁多平不漏平
 └── 最终仓位检查 → 未平则 EMERGENCY 告警
 ```
@@ -568,6 +562,80 @@ timestamp,grvt_rate,lighter_rate,rate_diff,state,direction,grvt_pos,lighter_pos
 ```
 
 日志文件输出到 `logs/` 目录。
+
+---
+
+## 推荐参数 / Recommended Parameters
+
+> **重要前提**：没有"保证盈利"的参数组合。以下是基于代码逻辑和市场常识的**保守配置**，核心思路是 **少交易、高胜率、严控风险**。建议先在 testnet 或极小仓位下验证。
+
+### 策略 1：Arb 套利（最成熟，风险最低）
+
+```bash
+python arbitrage.py --strategy arb --ticker BTC \
+  --size 0.002 --max-position 0.006 \
+  --long-threshold 12 --short-threshold 12 \
+  --min-spread 3 \
+  --signal-cooldown 5 \
+  --persistence-count 5 \
+  --warmup-samples 60 \
+  --natural-spread-window 600
+```
+
+| 参数 | 推荐值 | 理由 |
+|------|--------|------|
+| `threshold=12` | 比默认 10 高 | 只吃大价差，覆盖滑点 + 意外成本 |
+| `min-spread=3` | 全局门槛 | 过滤噪音信号 |
+| `signal-cooldown=5` | 5 秒冷却 | 防止连续追信号被逆向选择 |
+| `persistence-count=5` | 250ms 持续 | 过滤闪现假信号（5 × 50ms） |
+| `warmup=60, window=600` | 更长统计窗口 | 自然价差估计更稳定 |
+| `size=0.002, max-position=0.006` | 小仓位 | 最多 3 笔叠加，验证后再加量 |
+
+### 策略 2：均值回归（需先观察价差分布）
+
+```bash
+python arbitrage.py --strategy mean_reversion --ticker BTC \
+  --size 0.002 --max-position 0.004 \
+  --mr-window 600 --mr-entry-z 2.5 --mr-exit-z 0.3 --mr-stop-z 3.5 \
+  --mr-warmup 120 --mr-maker-timeout 30
+```
+
+| 参数 | 推荐值 | 理由 |
+|------|--------|------|
+| `entry-z=2.5` | 比默认 2.0 严格 | 只在价差显著偏离时入场 |
+| `exit-z=0.3` | 接近均值出场 | 吃足回归幅度 |
+| `stop-z=3.5` | 比默认 4.0 紧 | 3.5 sigma 已非常极端，及时止损 |
+| `window=600` | 10 分钟窗口 | 统计更稳健，减少过拟合 |
+| `warmup=120` | 2 分钟预热 | 均值/标准差充分收敛后再交易 |
+| `maker-timeout=30` | 30 秒等成交 | 太久价差可能已回归，不值得等 |
+
+> **前提**：先用 arb 模式的 CSV 数据（`data/bbo_*.csv`）分析 GRVT-Lighter 价差是否具有均值回归特性。如果价差是随机游走，MR 策略**必亏**。
+
+### 策略 3：Funding Rate（最慢、最稳，利润最薄）
+
+```bash
+python arbitrage.py --strategy funding_rate --ticker BTC \
+  --size 0.002 --max-position 0.004 \
+  --fr-check-interval 300 --fr-min-diff 0.0003 --fr-hold-min-hours 4
+```
+
+| 参数 | 推荐值 | 理由 |
+|------|--------|------|
+| `check-interval=300` | 5 分钟查一次 | Funding rate 变化慢，不需要频繁查询 |
+| `min-diff=0.0003` | 0.03% 差异才建仓 | 默认 0.01% 太敏感，手续费可能吃掉利润 |
+| `hold-min-hours=4` | 至少持仓 4 小时 | 给 funding 足够时间结算 |
+
+> **注意**：两个交易所的 funding rate 差异通常很小，扣除手续费后可能不赚钱。适合大资金 + 长期持仓。
+
+### 选择策略的建议
+
+| 顺序 | 策略 | 适合 | 备注 |
+|:----:|------|------|------|
+| 1 | **Arb** | 首选，最成熟 | 久经考验，bug 修过最多轮 |
+| 2 | **Mean Reversion** | 价差有均值回归特性时 | 需要先用 CSV 数据验证，否则必亏 |
+| 3 | **Funding Rate** | 大资金长期持仓 | 利润薄，适合 set-and-forget |
+
+> **仓位建议**：`size=0.002` BTC（~$180）足够验证策略。确认盈利模式后再逐步加量，不要一上来就大仓位。
 
 ---
 
