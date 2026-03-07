@@ -21,6 +21,10 @@ MINI_TICKER_RATE = 100  # ms
 ORDER_DURATION = 300  # seconds — post-only order TTL
 WS_STALE_THRESHOLD = 30  # seconds
 SEND_ERROR_GRACE_TIMEOUT = 1.5  # seconds
+# GRVT rejects limit orders outside its "price protection band" (error 7201).
+# Empirically the band is ~2-3% from mark price.  Cap emergency-close slippage
+# so the order stays within the band and doesn't get rejected outright.
+GRVT_MAX_CLOSE_SLIPPAGE = Decimal("0.02")
 
 # Ticker mapping: our short names → GRVT symbol format
 TICKER_MAP = {
@@ -632,18 +636,27 @@ class GrvtClient(BaseExchangeClient):
         if abs(position) == 0:
             return True
 
+        # Cap slippage to stay within GRVT's price protection band (error 7201).
+        # The exchange rejects limit orders beyond ~2-3% from mark price.
+        effective_slippage = min(slippage_pct, GRVT_MAX_CLOSE_SLIPPAGE)
+        if effective_slippage != slippage_pct:
+            logger.info(
+                f"GRVT close: slippage capped {float(slippage_pct)*100:.0f}% → "
+                f"{float(effective_slippage)*100:.0f}% (price protection band)"
+            )
+
         # Close: sell if long, buy if short
         if position > 0:
             side = "sell"
             if self._best_bid:
-                price = self._best_bid * (Decimal("1") - slippage_pct)
+                price = self._best_bid * (Decimal("1") - effective_slippage)
             else:
                 logger.error("Cannot close GRVT: no bid")
                 return False
         else:
             side = "buy"
             if self._best_ask:
-                price = self._best_ask * (Decimal("1") + slippage_pct)
+                price = self._best_ask * (Decimal("1") + effective_slippage)
             else:
                 logger.error("Cannot close GRVT: no ask")
                 return False
@@ -656,7 +669,10 @@ class GrvtClient(BaseExchangeClient):
 
         # Try REST first, then WS rpc as fallback
         try:
-            logger.info(f"GRVT close order (REST): {side} {close_size} @ {price} (tick-aligned)")
+            logger.info(
+                f"GRVT close order (REST): {side} {close_size} @ {price} "
+                f"(slippage={float(effective_slippage)*100:.1f}%, tick-aligned)"
+            )
 
             # Use REST create_order instead of WS rpc_create_order
             # WS rpc_create_order is fire-and-forget — orders get silently lost
@@ -682,6 +698,18 @@ class GrvtClient(BaseExchangeClient):
                 )
 
         except Exception as e:
+            error_str = str(e)
+            # Detect GRVT price protection band rejection (error 7201).
+            # No point retrying WS with the same price — it will also be rejected.
+            if "7201" in error_str or "price protection" in error_str.lower():
+                logger.error(
+                    f"GRVT close REJECTED by price protection band (7201): "
+                    f"{side} {close_size} @ {price} "
+                    f"(BBO: bid={self._best_bid} ask={self._best_ask}, "
+                    f"slippage={float(effective_slippage)*100:.1f}%)"
+                )
+                return False
+
             logger.error(f"GRVT close REST failed: {e}, trying WS rpc fallback")
             # Fallback: try WS rpc_create_order (fire-and-forget, but better than nothing)
             try:
