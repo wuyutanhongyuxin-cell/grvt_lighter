@@ -34,6 +34,8 @@ class SpreadAnalyzer:
         natural_spread_window: int = 300,
         warmup_samples: int = 30,
         persistence_count: int = 3,
+        direction_filter_window: int = 600,
+        direction_filter_threshold: float = 0.65,
     ):
         self.long_threshold = long_threshold
         self.short_threshold = short_threshold
@@ -52,8 +54,14 @@ class SpreadAnalyzer:
         self._natural_spread_short: Decimal = ZERO
 
         # Direction filter: track which exchange is more expensive
+        # Legacy (still used for natural spread median calculation)
         self._price_diff_history: deque[Decimal] = deque(maxlen=natural_spread_window)
         self._natural_price_diff: Decimal = ZERO  # median(grvt_mid - lighter_mid), >0 = GRVT贵
+        # Enhanced direction filter: positive-rate with neutral zone
+        self._dir_filter_history: deque[Decimal] = deque(maxlen=direction_filter_window)
+        self._dir_filter_threshold = direction_filter_threshold
+        self._dir_filter_min_samples = 30  # minimum samples before filtering kicks in
+        self._dir_positive_rate: float = 0.5  # exposed for logging
 
         # Warmup
         self._warmup_target = warmup_samples
@@ -111,7 +119,9 @@ class SpreadAnalyzer:
         self._raw_short_history.append(self.diff_short)
         grvt_mid = (grvt_bid + grvt_ask) / 2
         lighter_mid = (lighter_bid + lighter_ask) / 2
-        self._price_diff_history.append(grvt_mid - lighter_mid)
+        price_diff = grvt_mid - lighter_mid
+        self._price_diff_history.append(price_diff)
+        self._dir_filter_history.append(price_diff)
         self._update_count += 1
 
         # Step 5: Recompute natural spread every ~1s (20 ticks @ 50ms)
@@ -163,6 +173,10 @@ class SpreadAnalyzer:
             self._natural_price_diff = Decimal(
                 str(statistics.median(self._price_diff_history))
             )
+        # Recompute direction filter positive rate
+        if len(self._dir_filter_history) >= self._dir_filter_min_samples:
+            pos_count = sum(1 for d in self._dir_filter_history if d > ZERO)
+            self._dir_positive_rate = pos_count / len(self._dir_filter_history)
 
     def check_signal(self) -> Tuple[Optional[str], Decimal]:
         """
@@ -186,13 +200,9 @@ class SpreadAnalyzer:
             self.net_spread_long > long_trigger
             and self._long_persist_counter >= self._persistence_count
         ):
-            # Gate 4: Direction filter — don't buy on the expensive exchange
-            # natural_price_diff > 0 means GRVT is consistently more expensive
-            if self._natural_price_diff > ZERO:
-                logger.debug(
-                    f"Direction filter BLOCKED long_grvt: GRVT is more expensive "
-                    f"(price_diff=${self._natural_price_diff:.2f})"
-                )
+            # Gate 4: Direction filter — positive-rate with neutral zone
+            # _dir_positive_rate > threshold → GRVT structurally expensive → block long_grvt
+            if self._is_direction_blocked("long_grvt"):
                 return None, ZERO
             return "long_grvt", self.net_spread_long
 
@@ -200,17 +210,53 @@ class SpreadAnalyzer:
             self.net_spread_short > short_trigger
             and self._short_persist_counter >= self._persistence_count
         ):
-            # Gate 4: Direction filter — don't sell on the cheap exchange
-            # natural_price_diff < 0 means GRVT is consistently cheaper
-            if self._natural_price_diff < ZERO:
-                logger.debug(
-                    f"Direction filter BLOCKED short_grvt: GRVT is cheaper "
-                    f"(price_diff=${self._natural_price_diff:.2f})"
-                )
+            # Gate 4: Direction filter
+            # _dir_positive_rate < (1 - threshold) → GRVT structurally cheap → block short_grvt
+            if self._is_direction_blocked("short_grvt"):
                 return None, ZERO
             return "short_grvt", self.net_spread_short
 
         return None, ZERO
+
+    def _is_direction_blocked(self, direction: str) -> bool:
+        """Check if direction is blocked by the positive-rate filter.
+
+        positive_rate = ratio of (grvt_mid - lighter_mid > 0) in rolling window.
+          > threshold (e.g. 0.65): GRVT structurally expensive → block long_grvt
+          < 1-threshold (e.g. 0.35): GRVT structurally cheap → block short_grvt
+          between: neutral zone → allow both directions
+        """
+        if len(self._dir_filter_history) < self._dir_filter_min_samples:
+            return False  # not enough data → allow all
+
+        rate = self._dir_positive_rate
+        threshold = self._dir_filter_threshold
+
+        if direction == "long_grvt" and rate > threshold:
+            logger.debug(
+                f"Direction filter BLOCKED long_grvt: GRVT expensive "
+                f"(pos_rate={rate:.2f} > {threshold})"
+            )
+            return True
+        if direction == "short_grvt" and rate < (1 - threshold):
+            logger.debug(
+                f"Direction filter BLOCKED short_grvt: GRVT cheap "
+                f"(pos_rate={rate:.2f} < {1 - threshold})"
+            )
+            return True
+        return False
+
+    def _get_allowed_direction_label(self) -> str:
+        """Human-readable label for current direction filter state."""
+        if len(self._dir_filter_history) < self._dir_filter_min_samples:
+            return "both(warmup)"
+        rate = self._dir_positive_rate
+        threshold = self._dir_filter_threshold
+        if rate > threshold:
+            return f"short_only({rate:.0%})"
+        if rate < (1 - threshold):
+            return f"long_only({rate:.0%})"
+        return f"both({rate:.0%})"
 
     def get_stats(self) -> dict:
         long_trigger = max(self.long_threshold, self.min_spread)
@@ -243,8 +289,6 @@ class SpreadAnalyzer:
             "persist_required": self._persistence_count,
             "samples_collected": self._update_count,
             "natural_price_diff": self._natural_price_diff,
-            "direction_allowed": (
-                "both" if self._natural_price_diff == ZERO
-                else ("short_grvt" if self._natural_price_diff > ZERO else "long_grvt")
-            ),
+            "dir_positive_rate": self._dir_positive_rate,
+            "direction_allowed": self._get_allowed_direction_label(),
         }

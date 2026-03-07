@@ -49,6 +49,10 @@ class Config:
     warmup_samples: int = 30            # warmup sample count (~30s)
     persistence_count: int = 3          # signal must persist N ticks (N×50ms)
 
+    # Direction filter (positive-rate with neutral zone)
+    direction_filter_window: int = 600         # independent rolling window (~10min @1/s)
+    direction_filter_threshold: float = 0.65   # >0.65 = GRVT expensive → short only; <0.35 = long only
+
     # Strategy selection
     strategy: str = "arb"
 
@@ -104,6 +108,9 @@ class Config:
             natural_spread_window=args.natural_spread_window,
             warmup_samples=args.warmup_samples,
             persistence_count=args.persistence_count,
+            # Direction filter
+            direction_filter_window=args.direction_filter_window,
+            direction_filter_threshold=args.direction_filter_threshold,
             # Strategy selection
             strategy=args.strategy,
             # Mean Reversion
@@ -195,6 +202,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--natural-spread-window", type=int, default=300, help="Natural spread sliding window size (default: 300)")
     parser.add_argument("--warmup-samples", type=int, default=30, help="Warmup sample count before trading (default: 30)")
     parser.add_argument("--persistence-count", type=int, default=3, help="Signal persistence count required (default: 3)")
+    # Direction filter
+    parser.add_argument("--direction-filter-window", type=int, default=600, help="Direction filter rolling window size (default: 600, ~10min)")
+    parser.add_argument("--direction-filter-threshold", type=float, default=0.65, help="Direction filter threshold (default: 0.65, neutral zone 0.35-0.65)")
     # Strategy selection
     parser.add_argument("--strategy", default="arb", choices=["arb", "mean_reversion", "funding_rate"],
                         help="Strategy mode (default: arb)")

@@ -77,6 +77,8 @@ class ArbStrategy:
             natural_spread_window=config.natural_spread_window,
             warmup_samples=config.warmup_samples,
             persistence_count=config.persistence_count,
+            direction_filter_window=config.direction_filter_window,
+            direction_filter_threshold=config.direction_filter_threshold,
         )
         self.positions = PositionTracker(config.order_quantity, config.max_position)
         self.data_logger = DataLogger(config.ticker)
