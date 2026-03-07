@@ -155,6 +155,24 @@ class GrvtClient(BaseExchangeClient):
                         pass
             except Exception as e:
                 logger.warning(f"GRVT WS close error: {e}")
+
+            # Close the SDK's internal aiohttp HTTP session.
+            # Without this, GrvtCcxtPro.__del__ tries to close it after
+            # the event loop is gone → "RuntimeError: no running event loop"
+            try:
+                if hasattr(self._ws, '_session') and self._ws._session:
+                    if not self._ws._session.closed:
+                        await self._ws._session.close()
+                        logger.debug("GRVT SDK aiohttp session closed")
+            except Exception as e:
+                logger.debug(f"GRVT session close: {e}")
+            # Also try the CCXT standard close() if available
+            try:
+                if hasattr(self._ws, 'close'):
+                    await self._ws.close()
+            except Exception:
+                pass
+
         self._ws = None
         self._best_bid = None
         self._best_ask = None
@@ -634,7 +652,9 @@ class GrvtClient(BaseExchangeClient):
         price = self._align_price_to_tick(price, side)
 
         close_size = abs(position)
+        order_submitted = False
 
+        # Try REST first, then WS rpc as fallback
         try:
             logger.info(f"GRVT close order (REST): {side} {close_size} @ {price} (tick-aligned)")
 
@@ -652,6 +672,7 @@ class GrvtClient(BaseExchangeClient):
                 },
             )
 
+            order_submitted = True
             if result:
                 filled = result.get("filled_size", result.get("filled", "0"))
                 status = result.get("status", "")
@@ -660,8 +681,32 @@ class GrvtClient(BaseExchangeClient):
                     f"GRVT close REST response: cid={cid} status={status} filled={filled}"
                 )
 
-            # REST fallback: check if position actually closed
-            await asyncio.sleep(0.3)  # brief settle
+        except Exception as e:
+            logger.error(f"GRVT close REST failed: {e}, trying WS rpc fallback")
+            # Fallback: try WS rpc_create_order (fire-and-forget, but better than nothing)
+            try:
+                await self._ws.rpc_create_order(
+                    symbol=self._symbol,
+                    order_type="limit",
+                    side=side,
+                    amount=float(close_size),
+                    price=str(price),
+                    params={
+                        "time_in_force": "IMMEDIATE_OR_CANCEL",
+                        "reduce_only": True,
+                    },
+                )
+                order_submitted = True
+                logger.info(f"GRVT close WS rpc fallback sent: {side} {close_size} @ {price}")
+            except Exception as e2:
+                logger.error(f"GRVT close WS rpc fallback also failed: {e2}")
+
+        if not order_submitted:
+            return False
+
+        # Verify position actually closed
+        await asyncio.sleep(0.5)  # settle (increased from 0.3s)
+        try:
             remaining = await self.get_position()
             if abs(remaining) < abs(position) * Decimal("0.10"):
                 logger.info(f"GRVT close confirmed via REST: remaining={remaining}")
@@ -669,7 +714,7 @@ class GrvtClient(BaseExchangeClient):
             logger.warning(f"GRVT close not confirmed: remaining={remaining} (was {position})")
             return False
         except Exception as e:
-            logger.error(f"GRVT close_position error: {e}")
+            logger.error(f"GRVT close position check failed: {e}")
             return False
 
     async def get_funding_rate(self) -> Decimal:
